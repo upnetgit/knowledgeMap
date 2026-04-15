@@ -1,0 +1,53 @@
+CUDNN_BENCHMARK: true
+
+DATASETS:
+  TRAIN: "MSVDDataset"
+  VAL: "MSVDDataset"
+  TEST: "MSVDDataset"
+
+DATALOADER:
+  TRAIN_BATCH_SIZE: 32
+  TEST_BATCH_SIZE: 32
+  NUM_WORKERS: 4
+  FEATS_FOLDER: "./data/features"
+  ANNO_FOLDER: "./data/annotations"
+  SEQ_PER_SAMPLE: 1
+  MAX_FEAT_NUM: 25
+
+ENGINE:
+  NAME: "DefaultTrainer"
+
+MODEL:
+  VOCAB_SIZE: 2075
+  META_ARCHITECTURE: "RnnAttEncoderDecoder"
+  ENCODER: "Encoder"
+  ENCODER_DIM: 1024
+  DECODER: "SALSTMDecoder"
+  DECODER_DIM: 1024
+  PREDICTOR: "BasePredictor"
+  PRED_DROPOUT: 0.5
+  MAX_SEQ_LEN: 21
+
+  TOKEN_EMBED:
+    NAME: "TokenBaseEmbedding"
+    DIM: 1024
+    ACTIVATION: "relu"
+    USE_NORM: false
+    DROPOUT: 0.5
+
+  VISUAL_EMBED:
+    NAME: "VisualBaseEmbedding"
+    IN_DIM: 2048
+    OUT_DIM: 1024
+    ACTIVATION: "relu"
+    USE_NORM: false
+    DROPOUT: 0.5
+
+DECODE_STRATEGY:
+  NAME: "BeamSearcher"
+  BEAM_SIZE: 5
+
+INFERENCE:
+  VOCAB: "configs/video_captioning/vocabulary.txt"
+  GENERATION_MODE: true
+

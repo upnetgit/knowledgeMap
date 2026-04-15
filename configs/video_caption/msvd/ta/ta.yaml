@@ -1,0 +1,40 @@
+_BASE_: "../base_caption.yaml"
+
+# NOTE: This TA config is intended for inference-time loading in KG pipeline.
+# It keeps the classic RNN attention architecture expected by many MSVD TA checkpoints.
+MODEL:
+  META_ARCHITECTURE: "RnnAttEncoderDecoder"
+  ENCODER: "Encoder"
+  ENCODER_DIM: 1024
+  DECODER: "SALSTMDecoder"
+  DECODER_DIM: 1024
+  PREDICTOR: "BasePredictor"
+  PRED_DROPOUT: 0.5
+  MAX_SEQ_LEN: 21
+
+  TOKEN_EMBED:
+    NAME: "TokenBaseEmbedding"
+    DIM: 1024
+    ACTIVATION: "relu"
+    USE_NORM: false
+    DROPOUT: 0.5
+
+  VISUAL_EMBED:
+    NAME: "VisualBaseEmbedding"
+    IN_DIM: 2048
+    OUT_DIM: 1024
+    ACTIVATION: "relu"
+    USE_NORM: false
+    DROPOUT: 0.5
+
+DATALOADER:
+  MAX_FEAT_NUM: 25
+
+DECODE_STRATEGY:
+  NAME: "BeamSearcher"
+  BEAM_SIZE: 5
+
+INFERENCE:
+  VOCAB: "configs/video_captioning/vocabulary.txt"
+  GENERATION_MODE: true
+
