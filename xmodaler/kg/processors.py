@@ -51,6 +51,17 @@ def get_local_model_path(model_key: str) -> Optional[Path]:
         return None
 
 
+def resolve_torch_device(device_mode: str = "auto"):
+    """根据 device_mode 解析 torch 设备。"""
+    import torch
+    mode = str(device_mode or "auto").strip().lower()
+    if mode == "cpu":
+        return torch.device("cpu")
+    if mode == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class TextProcessor:
     """文本数据处理器"""
     
@@ -161,7 +172,7 @@ class TextProcessor:
 class ImageProcessor:
     """图像数据处理器"""
     
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: Optional[str] = None, device_mode: str = "auto"):
         """
         初始化图像处理器
         
@@ -169,6 +180,7 @@ class ImageProcessor:
             model_path: 预训练模型路径
         """
         self.model_path = model_path
+        self.device_mode = str(device_mode or "auto").strip().lower()
         self.model = None
         self._load_model()
     
@@ -178,7 +190,7 @@ class ImageProcessor:
             import torch
             import torchvision.models as models
             
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = resolve_torch_device(self.device_mode)
             base_model = models.resnet152(weights=None)
             local_weight = get_local_model_path('resnet152')
             if local_weight and local_weight.exists():
@@ -308,7 +320,7 @@ class ImageProcessor:
 class VideoProcessor:
     """视频数据处理器"""
     
-    def __init__(self, frames_per_video: int = 8):
+    def __init__(self, frames_per_video: int = 8, device_mode: str = "auto"):
         """
         初始化视频处理器
         
@@ -316,7 +328,8 @@ class VideoProcessor:
             frames_per_video: 每个视频采样帧数
         """
         self.frames_per_video = frames_per_video
-        self.image_processor = ImageProcessor()
+        self.device_mode = str(device_mode or "auto").strip().lower()
+        self.image_processor = ImageProcessor(device_mode=self.device_mode)
 
     def _extract_frame_feature(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         """直接复用图像主干提取单帧特征，避免临时落盘。"""
@@ -477,6 +490,7 @@ class CaptionGenerator:
         asr_model_size: str = "small",
         use_xmodaler_video: bool = True,
         xmodaler_model_type: str = "tdconved",
+        device_mode: str = "auto",
     ):
         """
         初始化描述生成器
@@ -497,6 +511,7 @@ class CaptionGenerator:
         self.asr_model_size = asr_model_size
         self.use_xmodaler_video = use_xmodaler_video
         self.xmodaler_model_type = str(xmodaler_model_type or "tdconved").strip().lower()
+        self.device_mode = str(device_mode or "auto").strip().lower()
         self.model = None
         self.processor = None
         self.ocr_model = None
@@ -511,6 +526,7 @@ class CaptionGenerator:
         self.tden_retrieval_model = None
         self.tden_retrieval_config = None
         self.device = None
+        self.xmodaler_load_error = ""
         self._load_model()
         if self.use_ocr:
             self._load_ocr_model()
@@ -528,16 +544,29 @@ class CaptionGenerator:
             import torch
             from LOCAL_MODEL_MANAGER import LocalModelManager
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = resolve_torch_device(self.device_mode)
             manager = LocalModelManager()
             local_blip = manager.get_model_path('blip')
             load_path = local_blip if local_blip else self.model_name
             if local_blip:
                 logger.info(f"优先使用本地BLIP模型: {local_blip}")
-            self.processor = BlipProcessor.from_pretrained(str(load_path), local_files_only=bool(local_blip))
-            self.model = BlipForConditionalGeneration.from_pretrained(
-                str(load_path), local_files_only=bool(local_blip)
-            ).to(device)
+
+            try:
+                self.processor = BlipProcessor.from_pretrained(str(load_path), local_files_only=bool(local_blip))
+                self.model = BlipForConditionalGeneration.from_pretrained(
+                    str(load_path), local_files_only=bool(local_blip)
+                ).to(device)
+            except Exception as local_err:
+                if local_blip:
+                    # 本地目录损坏时回退到模型名加载（有网可自动恢复，无网则继续降级到其他分支）
+                    logger.warning(f"本地BLIP加载失败，尝试远程模型ID回退: {local_err}")
+                    self.processor = BlipProcessor.from_pretrained(str(self.model_name), local_files_only=False)
+                    self.model = BlipForConditionalGeneration.from_pretrained(
+                        str(self.model_name), local_files_only=False
+                    ).to(device)
+                    load_path = self.model_name
+                else:
+                    raise
             self.device = device
             logger.info(f"已加载模型: {load_path}")
         except Exception as e:
@@ -548,11 +577,11 @@ class CaptionGenerator:
         try:
             import torch
             from xmodaler.config import get_cfg
-            from xmodaler.modeling import build_model
+            from xmodaler.modeling import build_model, add_config
             from xmodaler.checkpoint import XmodalerCheckpointer
             from LOCAL_MODEL_MANAGER import LocalModelManager
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = resolve_torch_device(self.device_mode)
             manager = LocalModelManager()
 
             if self.xmodaler_model_type == "tdconved":
@@ -597,7 +626,16 @@ class CaptionGenerator:
 
             # 加载配置
             cfg = get_cfg()
+            # 先根据目标 yaml 注册模型专属配置节点（如 MODEL.TDCONVED）
+            tmp_cfg = cfg.load_from_file_tmp(str(config_path))
+            add_config(cfg, tmp_cfg)
             cfg.merge_from_file(str(config_path))
+            # 推理场景下强制使用仓库内词表，避免训练配置中的相对路径漂移。
+            vocab_path = project_root / "configs" / "video_captioning" / "vocabulary.txt"
+            if vocab_path.exists():
+                cfg.INFERENCE.VOCAB = str(vocab_path)
+            # 与当前运行设备保持一致，避免 CPU 环境被默认 CUDA 配置拉起
+            cfg.MODEL.DEVICE = str(device)
             cfg.MODEL.WEIGHTS = str(model_path)
             cfg.freeze()
 
@@ -611,6 +649,7 @@ class CaptionGenerator:
             self.xmodaler_model = model
             self.xmodaler_config = cfg
             self.device = device
+            self.xmodaler_load_error = ""
             logger.info(f"已加载 xmodaler 视频字幕模型: {model_key} from {model_path}")
         except ModuleNotFoundError as e:
             logger.warning(
@@ -618,19 +657,39 @@ class CaptionGenerator:
                 str(e),
             )
             self.xmodaler_model = None
+            self.xmodaler_load_error = str(e)
         except Exception as e:
-            logger.warning(f"无法加载 xmodaler 视频字幕模型: {str(e)}")
+            logger.exception(f"无法加载 xmodaler 视频字幕模型: {str(e)}")
             self.xmodaler_model = None
+            self.xmodaler_load_error = str(e)
+
+    @staticmethod
+    def _load_vocab_file(vocab_path: Optional[str]) -> Optional[List[str]]:
+        if not vocab_path:
+            return None
+        path = Path(str(vocab_path))
+        if not path.exists() or not path.is_file():
+            return None
+        vocab = ['.']
+        try:
+            for line in path.read_text(encoding='utf-8', errors='ignore').splitlines():
+                token = line.strip()
+                if token:
+                    vocab.append(token)
+            return vocab
+        except Exception:
+            return None
 
     def _load_tden_image_caption_model(self):
         """加载 TDEN 图像字幕模型（替代 BLIP）。"""
         try:
             import torch
             from xmodaler.config import get_cfg
-            from xmodaler.modeling import build_model
+            from xmodaler.modeling import build_model, add_config
+            from xmodaler.checkpoint import XmodalerCheckpointer
             from LOCAL_MODEL_MANAGER import LocalModelManager
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = resolve_torch_device(self.device_mode)
             manager = LocalModelManager()
 
             # 查找 TDEN 模型权重
@@ -651,12 +710,17 @@ class CaptionGenerator:
 
             # 加载配置
             cfg = get_cfg()
+            tmp_cfg = cfg.load_from_file_tmp(str(config_path))
+            add_config(cfg, tmp_cfg)
             cfg.merge_from_file(str(config_path))
+            cfg.MODEL.DEVICE = str(device)
             cfg.MODEL.WEIGHTS = str(model_path)
             cfg.freeze()
 
             # 构建模型
             model = build_model(cfg)
+            checkpointer = XmodalerCheckpointer(model)
+            checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=False)
             model.eval()
             model = model.to(device)
 
@@ -665,7 +729,7 @@ class CaptionGenerator:
             self.device = device
             logger.info(f"已加载 TDEN 图像字幕模型（CIDEr优化）from {model_path}")
         except Exception as e:
-            logger.warning(f"无法加载 TDEN 图像字幕模型: {str(e)}")
+            logger.exception(f"无法加载 TDEN 图像字幕模型: {str(e)}")
             self.tden_image_model = None
 
     def _load_tden_retrieval_model(self):
@@ -673,10 +737,11 @@ class CaptionGenerator:
         try:
             import torch
             from xmodaler.config import get_cfg
-            from xmodaler.modeling import build_model
+            from xmodaler.modeling import build_model, add_config
+            from xmodaler.checkpoint import XmodalerCheckpointer
             from LOCAL_MODEL_MANAGER import LocalModelManager
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = resolve_torch_device(self.device_mode)
             manager = LocalModelManager()
 
             # 查找 TDEN 检索模型权重
@@ -697,12 +762,17 @@ class CaptionGenerator:
 
             # 加载配置
             cfg = get_cfg()
+            tmp_cfg = cfg.load_from_file_tmp(str(config_path))
+            add_config(cfg, tmp_cfg)
             cfg.merge_from_file(str(config_path))
+            cfg.MODEL.DEVICE = str(device)
             cfg.MODEL.WEIGHTS = str(model_path)
             cfg.freeze()
 
             # 构建模型
             model = build_model(cfg)
+            checkpointer = XmodalerCheckpointer(model)
+            checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=False)
             model.eval()
             model = model.to(device)
 
@@ -711,7 +781,7 @@ class CaptionGenerator:
             self.device = device
             logger.info(f"已加载 TDEN 检索模型（Flickr30K）from {model_path}")
         except Exception as e:
-            logger.warning(f"无法加载 TDEN 检索模型: {str(e)}")
+            logger.exception(f"无法加载 TDEN 检索模型: {str(e)}")
             self.tden_retrieval_model = None
 
     def _load_ocr_model(self):
@@ -742,7 +812,12 @@ class CaptionGenerator:
 
             try:
                 import torch
-                use_cuda = bool(torch.cuda.is_available())
+                if self.device_mode == "cpu":
+                    use_cuda = False
+                elif self.device_mode == "cuda":
+                    use_cuda = bool(torch.cuda.is_available())
+                else:
+                    use_cuda = bool(torch.cuda.is_available())
             except Exception:
                 use_cuda = False
 
@@ -848,28 +923,39 @@ class CaptionGenerator:
 
     @staticmethod
     def _prepare_ocr_images_for_ppt(frame_np: np.ndarray) -> List["Image.Image"]:
-        """针对PPT页面生成多份OCR输入：灰度、放大、去噪、二值化。"""
+        """针对PPT页面生成多份OCR输入：灰度、放大、去噪、二值化（优化版）。"""
         from PIL import Image
 
         gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
         # 小字号课件普遍存在压缩模糊，2x 放大可显著提升识别稳定性。
         upscaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        denoise = cv2.medianBlur(upscaled, 3)
 
-        _, binary_otsu = cv2.threshold(denoise, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 更强的去噪：先进行双边滤波（保留边界），再中值滤波
+        bilateral = cv2.bilateralFilter(upscaled, 9, 75, 75)
+        denoise = cv2.medianBlur(bilateral, 5)
+
+        # 对比度增强：CLAHE（自适应直方图均衡化）
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(denoise)
+
+        # 多种二值化方式以适应不同的PPT背景
+        _, binary_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         binary_adaptive = cv2.adaptiveThreshold(
-            denoise,
+            enhanced,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             35,
             11,
         )
+        # 三值化：对灰色文字有更好的保留
+        _, binary_tri = cv2.threshold(denoise, 127, 255, cv2.THRESH_BINARY)
 
         return [
-            Image.fromarray(binary_otsu),
-            Image.fromarray(binary_adaptive),
-            Image.fromarray(denoise),
+            Image.fromarray(binary_otsu),      # Otsu 自适应阈值
+            Image.fromarray(binary_adaptive),  # 局部自适应阈值（最稳定）
+            Image.fromarray(enhanced),         # 增强但未二值化（保留灰度信息）
+            Image.fromarray(binary_tri),       # 三值化（适合灰色文字）
         ]
 
     @staticmethod
@@ -879,7 +965,7 @@ class CaptionGenerator:
         return any('\u4e00' <= ch <= '\u9fff' for ch in text)
 
     def _score_ocr_text(self, text: str) -> float:
-        """为OCR候选打分，中文字符占比越高得分越高。"""
+        """为OCR候选打分，优先中文准确性。"""
         normalized = normalize_zh_text(text)
         if not normalized:
             return float("-inf")
@@ -888,12 +974,24 @@ class CaptionGenerator:
         zh_count = sum(1 for ch in normalized if '\u4e00' <= ch <= '\u9fff')
         digit_count = sum(1 for ch in normalized if ch.isdigit())
         ascii_alpha_count = sum(1 for ch in normalized if ch.isascii() and ch.isalpha())
+        punctuation_count = sum(1 for ch in normalized if ch in '，。！？；：（）')
 
-        score = (zh_count * 3.0) + (digit_count * 0.15) + (min(total_len, 120) * 0.05)
-        # 若几乎全是ASCII字母，则降低分值（常见于误识别噪声）
-        score -= ascii_alpha_count * 0.08
+        # 计分策略：
+        # - 中文字符权重最高（3.0）：教学课件主要信息
+        # - 数字和标点符号有益（教学内容常含数字）
+        # - 纯ASCII碎片词为噪声，大幅降权
+        score = (zh_count * 3.5)  # 中文为主体
+        score += (digit_count * 0.2)  # 数字有用
+        score += (punctuation_count * 0.15)  # 标点符号指示段落结构
+        score += (min(total_len, 200) * 0.02)  # 长度奖励（但不过度）
+
+        # 惩罚纯ASCII垃圾
+        score -= ascii_alpha_count * 0.15
+
+        # 若几乎全是ASCII字母（乱码特征），大幅降低
         if zh_count == 0 and ascii_alpha_count > 20:
-            score -= 6.0
+            score -= 15.0
+
         return score
 
     def _is_likely_garbled_ocr(self, text: str) -> bool:
@@ -916,21 +1014,78 @@ class CaptionGenerator:
             return True
         return False
 
+    @staticmethod
+    def _is_blip_caption_low_quality(caption: str) -> bool:
+        """
+        检测BLIP描述是否质量低（常见乱码或过度通用）
+        
+        Args:
+            caption: BLIP生成的描述文本
+            
+        Returns:
+            True 表示质量低，False 表示质量可接受
+        """
+        if not caption:
+            return True
+        
+        text = caption.lower().strip()
+        
+        # 长度过短
+        if len(text) < 10:
+            return True
+        
+        # 常见乱码模式（已从日志中观察）
+        garbled_patterns = [
+            "sh re erarmi",
+            "tear agar",
+            "bra ee",
+            "are ratan",
+            "feta gor",
+            "ere eer"
+        ]
+        for pattern in garbled_patterns:
+            if pattern in text:
+                return True
+        
+        # 大量单个字母分散排列
+        single_chars = sum(1 for char in text if char.isalpha() and text.count(char) == 1)
+        if len(text) > 20 and single_chars / len(text) > 0.4:
+            return True
+        
+        # 无意义的重复单字母（如"e e e e"）
+        import re
+        repeated_singles = re.findall(r'(\b\w\b\s+)+', text)
+        if len(repeated_singles) > 5:
+            return True
+        
+        return False
+
     def generate_image_caption(self, image_path: str) -> Optional[str]:
         """
-        为图像生成描述
-        
+        为图像生成描述（优化版）
+
         Args:
             image_path: 图像文件路径
             
         Returns:
             图像描述
         """
+        # 中文教学场景：OCR是主要信息源，英文模型仅作补充
+        ocr_text = None
+        blip_caption = None
+
+        # 优先处理OCR，这是中文场景的核心
+        if self.use_ocr:
+            ocr_text = self.recognize_text_from_image(image_path)
+            if ocr_text and len(ocr_text.strip()) >= 8:
+                logger.info(f"[{Path(image_path).name}] OCR识别成功，主要文字: {ocr_text[:80]}...")
+                # OCR优先，直接返回带标记的文字
+                return normalize_zh_text(f"教学课件，主要文字：{ocr_text}")
+
+        # 若OCR未获得有效文字，尝试BLIP描述
         if not self.model or not self.processor:
-            # 即使视觉描述模型不可用，仍可尝试OCR生成中文页面描述。
-            ocr_only_text = self.recognize_text_from_image(image_path) if self.use_ocr else None
-            if ocr_only_text:
-                return normalize_zh_text(f"教学课件页面，主要文字：{ocr_only_text}")
+            if ocr_text:
+                return normalize_zh_text(f"教学课件，文字：{ocr_text}")
             return None
         
         try:
@@ -941,22 +1096,39 @@ class CaptionGenerator:
             inputs = self.processor(image, return_tensors="pt").to(self.device)
             
             with torch.no_grad():
-                out = self.model.generate(**inputs, max_length=50)
-            
-            caption = normalize_zh_text(self.processor.decode(out[0], skip_special_tokens=True))
+                # 优化参数：增加max_length，使用beam search，过滤短结果
+                out = self.model.generate(
+                    **inputs,
+                    max_length=100,
+                    min_length=15,
+                    num_beams=3,
+                    no_repeat_ngram_size=2,
+                    early_stopping=True,
+                    temperature=0.7
+                )
 
-            # 中文教学场景优先：OCR作为主体，BLIP英文描述仅补充上下文。
-            ocr_text = self.recognize_text_from_image(image_path) if self.use_ocr else None
-            if ocr_text and len(ocr_text.strip()) >= 8:
-                if caption:
-                    return normalize_zh_text(f"教学课件页面，主要文字：{ocr_text}。图像提示（英文模型）：{caption}")
-                return normalize_zh_text(f"教学课件页面，主要文字：{ocr_text}")
+            blip_caption = normalize_zh_text(self.processor.decode(out[0], skip_special_tokens=True))
 
-            if caption:
-                return normalize_zh_text(f"图像内容（英文模型）：{caption}")
+            # 过滤质量差的BLIP描述（常见乱码或通用短语）
+            if blip_caption and self._is_blip_caption_low_quality(blip_caption):
+                logger.info(f"[{Path(image_path).name}] BLIP描述质量低，已忽略")
+                if ocr_text:
+                    return normalize_zh_text(f"教学课件，文字：{ocr_text}")
+                return None
+
+            # 融合结果
+            if ocr_text and blip_caption:
+                return normalize_zh_text(f"教学课件，主要文字：{ocr_text}。图像信息（英文）：{blip_caption}")
+            elif ocr_text:
+                return normalize_zh_text(f"教学课件，文字：{ocr_text}")
+            elif blip_caption:
+                return normalize_zh_text(f"图像：{blip_caption}")
+
             return None
         except Exception as e:
             logger.error(f"描述生成失败 {image_path}: {str(e)}")
+            if ocr_text:
+                return normalize_zh_text(f"教学课件，文字：{ocr_text}")
             return None
 
     def generate_video_caption_xmodaler(self, video_path: str) -> Optional[Dict[str, Optional[str]]]:
@@ -976,6 +1148,7 @@ class CaptionGenerator:
         try:
             import torch
             from xmodaler.functional import decode_sequence
+            from xmodaler.config import kfg
 
             # 从视频抽取特征（ResNet152，与 xmodaler 配套）
             video_processor = VideoProcessor(frames_per_video=50)  # xmodaler 标准是 50 帧
@@ -999,20 +1172,47 @@ class CaptionGenerator:
             features = features[:50]
 
             feat_array = np.array(features, dtype=np.float32)  # (50, 2048)
-            feat_tensor = torch.from_numpy(feat_array).float().unsqueeze(0)  # (1, 50, 2048)
-            mask = torch.ones(1, 50).float()
+            feat_tensor = torch.from_numpy(feat_array).float()  # (50, 2048)
 
-            # 构造输入
-            batched_inputs = {
-                'att_feats': feat_tensor.to(self.device),
-                'att_masks': mask.to(self.device),
-                'ids': ['video'],
-            }
+            # xmodaler 期望输入为 List[Dict] 且字段使用 kfg 常量（大写键）
+            batched_inputs = [{
+                kfg.ATT_FEATS: feat_tensor.to(self.device),
+                kfg.IDS: 'video',
+            }]
 
             # 推理
             with torch.no_grad():
                 outputs = self.xmodaler_model(batched_inputs, use_beam_search=True, output_sents=True)
-                xmodaler_caption = outputs['output'][0] if outputs.get('output') else None
+                output_key = getattr(kfg, 'OUTPUT', 'OUTPUT')
+                output_value = None
+                if isinstance(outputs, dict):
+                    output_value = outputs.get(output_key)
+                    if output_value is None:
+                        output_value = outputs.get('output')
+
+                xmodaler_caption = None
+                if isinstance(output_value, (list, tuple)) and len(output_value) > 0:
+                    first_item = output_value[0]
+                    if isinstance(first_item, str):
+                        xmodaler_caption = first_item
+                    elif torch.is_tensor(first_item):
+                        vocab = self._load_vocab_file(getattr(getattr(self.xmodaler_config, 'INFERENCE', None), 'VOCAB', ''))
+                        if vocab is not None:
+                            try:
+                                decoded = decode_sequence(vocab, first_item)
+                                if decoded:
+                                    xmodaler_caption = decoded[0]
+                            except Exception:
+                                pass
+                elif torch.is_tensor(output_value):
+                    vocab = self._load_vocab_file(getattr(getattr(self.xmodaler_config, 'INFERENCE', None), 'VOCAB', ''))
+                    if vocab is not None:
+                        try:
+                            decoded = decode_sequence(vocab, output_value)
+                            if decoded:
+                                xmodaler_caption = decoded[0]
+                        except Exception:
+                            pass
 
             # 补充其他文本来源
             ocr_text = None
@@ -1091,6 +1291,8 @@ class CaptionGenerator:
                     caption = normalize_zh_text(' '.join(parts))
                     logger.info(f"使用 xmodaler 生成视频描述: {caption[:100]}...")
                     return caption
+            elif self.use_xmodaler_video and not self.xmodaler_model:
+                logger.warning(f"xmodaler 模型未加载，原因: {self.xmodaler_load_error or 'unknown'}")
 
             # 方案 B：回退到 BLIP+OCR+ASR
             logger.info("xmodaler 不可用或生成失败，改用 BLIP+OCR+ASR")
@@ -1107,11 +1309,14 @@ class CaptionGenerator:
             cv2.imwrite(temp_path, frames[middle_frame_idx])
 
             ocr_texts: List[str] = []
-            sample_indices = np.linspace(0, len(frames) - 1, min(len(frames), 6), dtype=int)
+            # 优化策略：增加OCR采样帧数（教学视频通常较长，需要更全面的文字覆盖）
+            sample_count = min(len(frames), 10)  # 增加到10帧（从6帧）
+            sample_indices = np.linspace(0, len(frames) - 1, sample_count, dtype=int)
 
             try:
                 blip_caption = self.generate_image_caption(temp_path)
                 if self.use_ocr:
+                    logger.info(f"视频OCR采样: {sample_count}帧")
                     for idx in sample_indices:
                         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as frame_file:
                             frame_path = frame_file.name
@@ -1144,33 +1349,46 @@ class CaptionGenerator:
             logger.error(f"视频描述生成失败: {str(e)}")
             return None
 
-    @staticmethod
-    def _aggregate_ocr_texts(texts: List[str]) -> Optional[str]:
-        """聚合多帧 OCR 结果，去重并优先保留高频文本。"""
+    def _aggregate_ocr_texts(self, texts: List[str]) -> Optional[str]:
+        """聚合多帧 OCR 结果，去重去噪，优先保留高频文本。"""
         if not texts:
             return None
-        cleaned = [normalize_zh_text(text) for text in texts if normalize_zh_text(text)]
+        
+        # 规范化并过滤乱码
+        cleaned = []
+        for text in texts:
+            normalized = normalize_zh_text(text)
+            if normalized and not self._is_likely_garbled_ocr(normalized):
+                cleaned.append(normalized)
+        
         if not cleaned:
             return None
 
         from collections import Counter
 
         counter = Counter(cleaned)
+        # 基于频率和长度排序，优先选择稳定且完整的文本
         ranked = sorted(counter.items(), key=lambda item: (-item[1], -len(item[0])))
-        merged = " ".join([item[0] for item in ranked[:8]])
-        return normalize_zh_text(merged) if merged else None
+        
+        # 返回最高频的文本（而不是拼接），避免重复
+        best_text = ranked[0][0] if ranked else None
+        
+        logger.info(f"聚合 {len(texts)} 帧OCR结果，{len(cleaned)} 个有效，最优: {best_text[:100] if best_text else 'None'}...")
+        return normalize_zh_text(best_text) if best_text else None
 
     def _fusion_captions(self,
                          blip_caption: Optional[str],
                          ocr_text: Optional[str],
                          asr_text: Optional[str] = None) -> Optional[str]:
         """
-        融合BLIP描述和OCR文字
+        融合视频多模态描述
+
+        优先级：OCR（视觉文字）> ASR（讲解语音）> BLIP（英文描述）
 
         Args:
-            blip_caption: BLIP生成的英文描述
-            ocr_text: OCR识别的中文文字
-            asr_text: ASR识别的讲解语音文本
+            blip_caption: BLIP生成的英文描述（可能含乱码，低优先级）
+            ocr_text: OCR识别的中文文字（教学课件核心）
+            asr_text: ASR识别的讲解语音文本（教学讲解核心）
 
         Returns:
             融合后的描述
@@ -1178,25 +1396,32 @@ class CaptionGenerator:
         if not blip_caption and not ocr_text and not asr_text:
             return None
 
-        # A方案：OCR优先，ASR补充，BLIP兜底
+        # A方案：多模态智能融合
         parts: List[str] = []
-        if ocr_text and len(ocr_text.strip()) > 10:
-            parts.append(f"主要文字: {ocr_text}")
-            if asr_text and len(asr_text.strip()) > 8:
-                parts.append(f"讲解内容: {asr_text}")
-            if blip_caption:
-                parts.append(f"图像提示(英文): {blip_caption}")
-            return normalize_zh_text(' '.join(parts))
 
-        if asr_text and len(asr_text.strip()) > 8:
-            parts.append(f"讲解内容: {asr_text}")
-            if blip_caption:
-                parts.append(f"图像提示(英文): {blip_caption}")
-            return normalize_zh_text(' '.join(parts))
+        # 步骤 1：OCR 文字作为主体信息（教学课件可视化内容）
+        if ocr_text and len(ocr_text.strip()) >= 10:
+            parts.append(f"教学课件：{ocr_text}")
 
-        if blip_caption:
-            return normalize_zh_text(f"图像内容(英文模型): {blip_caption}")
-        return None
+        # 步骤 2：ASR 讲解内容作为补充（教学讲解语音）
+        if asr_text and len(asr_text.strip()) >= 15:
+            parts.append(f"讲解：{asr_text[:200]}")  # 限制ASR长度，避免过冗长
+
+        # 步骤 3：BLIP描述作为备选，但仅在无OCR或ASR时使用
+        if blip_caption and not ocr_text and not asr_text:
+            # 只有在没有中文信息时才用BLIP英文描述
+            parts.append(f"图像描述：{blip_caption}")
+        elif blip_caption and not ocr_text:
+            # OCR 失败但有 ASR，BLIP 可作补充
+            parts.append(f"图像参考：{blip_caption}")
+
+        if not parts:
+            # 所有源都缺失或质量低
+            return None
+
+        result = normalize_zh_text(' | '.join(parts))
+        logger.info(f"融合多模态描述: {result[:120]}...")
+        return result
 
 
 class VideoEditor:
