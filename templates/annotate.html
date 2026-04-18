@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频人工标注</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f5f7fb; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 8px; padding: 20px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .panel { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+        h1, h2 { margin-top: 0; }
+        label { display: block; margin-top: 10px; font-weight: bold; }
+        input, select, textarea, button { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
+        textarea { min-height: 100px; }
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .status { margin-top: 12px; color: #1f6f43; }
+        .error { color: #b42318; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>视频人工标注（可选步骤）</h1>
+    <p>该页面仅用于人工补充标注，不会影响现有自动构建流程。</p>
+    <div class="grid">
+        <div class="panel">
+            <h2>视频播放</h2>
+            <label for="videoSelect">选择视频</label>
+            <select id="videoSelect"></select>
+            <video id="videoPlayer" controls style="width:100%; margin-top:12px; max-height:420px;"></video>
+            <div class="row">
+                <button type="button" onclick="markStart()">记录开始时间</button>
+                <button type="button" onclick="markEnd()">记录结束时间</button>
+            </div>
+        </div>
+        <div class="panel">
+            <h2>标注信息</h2>
+            <form id="annotationForm" onsubmit="saveAnnotation(event)">
+                <div class="row">
+                    <div>
+                        <label for="startSec">开始秒</label>
+                        <input id="startSec" type="number" step="0.1" min="0" value="0">
+                    </div>
+                    <div>
+                        <label for="endSec">结束秒</label>
+                        <input id="endSec" type="number" step="0.1" min="0" value="60">
+                    </div>
+                </div>
+                <label for="computerEntity">计算机知识点（可多选）</label>
+                <select id="computerEntity" multiple size="8"></select>
+                <label for="ideologyEntity">思政元素（可多选）</label>
+                <select id="ideologyEntity" multiple size="8"></select>
+                <div style="margin-top:6px;color:#666;font-size:12px;">提示：可只选择计算机或只选择思政，但至少选择一类。</div>
+                <label for="caption">人工描述</label>
+                <textarea id="caption" placeholder="例如：讲解栈和队列差异，强调逻辑推理。"></textarea>
+                <label for="ocrText">字幕/OCR文本</label>
+                <textarea id="ocrText" placeholder="可选，填写视频中关键文字。"></textarea>
+                <label for="confidence">置信度 (0~1)</label>
+                <input id="confidence" type="number" min="0" max="1" step="0.01" value="0.85">
+                <label for="annotator">标注人</label>
+                <input id="annotator" type="text" placeholder="可选">
+                <button type="submit" style="margin-top:12px;">保存标注</button>
+            </form>
+            <div id="status" class="status"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+let videoItems = [];
+
+function showStatus(message, isError=false) {
+    const box = document.getElementById('status');
+    box.className = isError ? 'status error' : 'status';
+    box.textContent = message;
+}
+
+function secondsNow() {
+    const player = document.getElementById('videoPlayer');
+    return Number(player.currentTime || 0).toFixed(1);
+}
+
+function markStart() {
+    document.getElementById('startSec').value = secondsNow();
+}
+
+function markEnd() {
+    document.getElementById('endSec').value = secondsNow();
+}
+
+function updateVideoPlayer() {
+    const idx = Number(document.getElementById('videoSelect').value || 0);
+    const item = videoItems[idx];
+    const player = document.getElementById('videoPlayer');
+    if (!item) {
+        player.removeAttribute('src');
+        return;
+    }
+    player.src = item.url;
+    player.load();
+}
+
+async function loadVideos() {
+    const resp = await fetch('/api/annotation/videos');
+    const data = await resp.json();
+    videoItems = data.videos || [];
+    const select = document.getElementById('videoSelect');
+    select.innerHTML = '';
+    videoItems.forEach((item, idx) => {
+        const opt = document.createElement('option');
+        opt.value = idx;
+        opt.textContent = item.name;
+        select.appendChild(opt);
+    });
+    select.onchange = updateVideoPlayer;
+    updateVideoPlayer();
+}
+
+function fillSelect(id, values) {
+    const select = document.getElementById(id);
+    select.innerHTML = '';
+    (values || []).forEach((value) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = value;
+        select.appendChild(opt);
+    });
+}
+
+function getMultiValues(id) {
+    const select = document.getElementById(id);
+    return Array.from(select.selectedOptions || []).map(opt => (opt.value || '').trim()).filter(Boolean);
+}
+
+async function loadEntities() {
+    const resp = await fetch('/api/annotation/entities');
+    const data = await resp.json();
+    fillSelect('computerEntity', data.computer_entities || []);
+    fillSelect('ideologyEntity', data.ideology_entities || []);
+}
+
+async function saveAnnotation(event) {
+    event.preventDefault();
+    const idx = Number(document.getElementById('videoSelect').value || 0);
+    const item = videoItems[idx];
+    if (!item) {
+        showStatus('请先选择视频。', true);
+        return;
+    }
+
+    const payload = {
+        video_name: item.name,
+        video_path: item.relative_path,
+        start_sec: Number(document.getElementById('startSec').value || 0),
+        end_sec: Number(document.getElementById('endSec').value || 0),
+        computer_entities: getMultiValues('computerEntity'),
+        ideology_entities: getMultiValues('ideologyEntity'),
+        caption: document.getElementById('caption').value,
+        ocr_text: document.getElementById('ocrText').value,
+        confidence: Number(document.getElementById('confidence').value || 0.85),
+        annotator: document.getElementById('annotator').value,
+    };
+
+    // 兼容旧后端/脚本字段
+    payload.computer_entity = payload.computer_entities[0] || '';
+    payload.ideology_entity = payload.ideology_entities[0] || '';
+
+    if (payload.computer_entities.length === 0 && payload.ideology_entities.length === 0) {
+        showStatus('请至少选择一个计算机知识点或思政元素。', true);
+        return;
+    }
+
+    const resp = await fetch('/api/annotation/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+        showStatus(data.error || '保存失败', true);
+        return;
+    }
+    showStatus('保存成功: ' + (data.annotation_id || '')); 
+}
+
+async function init() {
+    try {
+        await loadEntities();
+        await loadVideos();
+    } catch (err) {
+        showStatus('初始化失败: ' + err, true);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
