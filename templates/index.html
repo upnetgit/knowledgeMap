@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨模态知识图谱查询系统</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 20px;
+            padding: 30px;
+        }
+        
+        .sidebar {
+            border-right: 2px solid #eee;
+            padding-right: 20px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+        }
+        
+        .section h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        
+        .search-box {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        input[type="text"] {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            padding: 12px 25px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+        
+        button:hover {
+            background: #764ba2;
+        }
+        
+        .results {
+            background: #f8f9fa;
+            border-radius: 5px;
+            padding: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .result-item {
+            background: white;
+            padding: 12px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .result-item:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transform: translateX(5px);
+        }
+        
+        .result-item .entity-name {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .result-item .relation {
+            font-size: 0.9em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        
+        .result-item .media-info {
+            font-size: 0.85em;
+            color: #999;
+        }
+        
+        #graph-container {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background: #f8f9fa;
+            height: 600px;
+            position: relative;
+        }
+        
+        .legend {
+            margin-top: 15px;
+            font-size: 0.9em;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .legend-color {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+        
+        .tooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            pointer-events: none;
+            z-index: 1000;
+        }
+        
+        .stats {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        
+        .stat-item {
+            background: white;
+            padding: 12px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .video-container {
+            margin-top: 20px;
+            background: #f8f9fa;
+            border-radius: 5px;
+            padding: 15px;
+        }
+        
+        .video-item {
+            margin-bottom: 15px;
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 4px solid #5cb85c;
+        }
+        
+        .video-item video {
+            width: 100%;
+            max-height: 300px;
+            border-radius: 5px;
+        }
+        
+        .entity-section {
+            margin-bottom: 20px;
+        }
+        
+        .entity-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .entity-tag {
+            background: #e9ecef;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 0.9em;
+            color: #495057;
+        }
+
+        .recommend-card {
+            background: #fff;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+
+        .recommend-title {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 4px;
+        }
+
+        .recommend-meta {
+            font-size: 0.86em;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .recommend-risk {
+            font-size: 0.85em;
+            color: #b94a48;
+        }
+
+        .recommend-suggest {
+            font-size: 0.85em;
+            color: #3c763d;
+        }
+
+        .upload-box {
+            background: #f8f9fa;
+            border: 1px solid #e3e6ea;
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .mini-chart {
+            margin-top: 10px;
+            background: #fff;
+            border-radius: 6px;
+            border: 1px solid #ececec;
+            padding: 8px;
+            min-height: 150px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌐 跨模态知识图谱查询系统</h1>
+            <p>连接计算机和思想实体的多模态知识网络</p>
+        </div>
+        
+        <div class="content">
+            <div class="sidebar">
+                <div class="section">
+                    <h2>🔍 查询</h2>
+                    <div class="search-box">
+                        <input type="text" id="searchInput" placeholder="输入实体名称...">
+                        <button onclick="searchEntity()">查询</button>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2>📊 结果</h2>
+                    <div class="results" id="results"></div>
+                </div>
+                
+                <div class="section">
+                    <h2>📈 统计</h2>
+                    <div id="stats"></div>
+                </div>
+
+                <div class="section">
+                    <h2>⬆️ 上传并增量入图</h2>
+                    <div class="upload-box">
+                        <input type="file" id="mediaUploadInput" accept="image/*,video/*">
+                        <button style="margin-top:8px; width:100%;" onclick="uploadAndIngest()">上传并处理</button>
+                        <div id="uploadStatus" style="margin-top:8px; color:#666; font-size:12px;"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="main">
+                <div class="section">
+                    <h2>🗺️ 知识图谱可视化</h2>
+                    <div id="graph-container"></div>
+                    <div id="graph-charts" class="mini-chart"></div>
+                    <div class="legend">
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #667eea;"></div>
+                            <span>文本实体 (连接媒体数)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #f0ad4e;"></div>
+                            <span>图像 (图像标注)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #5cb85c;"></div>
+                            <span>视频 (视频标注)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #d9534f;"></div>
+                            <span>实体关系</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section entity-section">
+                    <h2>📂 实体详情</h2>
+                    <div id="entityDetails"></div>
+                </div>
+                
+                <div class="section video-container">
+                    <h2>📹 视频播放</h2>
+                    <div id="videoPlayer"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 初始化知识图谱
+        function initializeGraph() {
+            renderGraph({nodes: [], links: [], stats: {total_nodes: 0, total_edges: 0}});
+            updateStats({total_nodes: 0, total_edges: 0});
+            renderCharts({relation_distribution: {}, media_distribution: {}});
+        }
+
+        function escapeHtml(text) {
+            return String(text || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function loadSubgraph(entity) {
+            if (!entity) return;
+            fetch(`/api/graph/subgraph?entity=${encodeURIComponent(entity)}&hops=2`)
+                .then(response => response.json())
+                .then(data => {
+                    renderGraph(data);
+                    updateStats(data.stats || {total_nodes: 0, total_edges: 0});
+                    renderCharts(data.charts || {relation_distribution: {}, media_distribution: {}});
+                })
+                .catch(error => console.error('Subgraph Error:', error));
+        }
+        
+        // 渲染知识图谱
+        function renderGraph(data) {
+            const container = document.getElementById('graph-container');
+            container.innerHTML = ''; // 清空容器
+            
+            const width = container.offsetWidth;
+            const height = container.offsetHeight;
+            
+            const svg = d3.select('#graph-container')
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height);
+
+            const defs = svg.append('defs');
+            defs.append('marker')
+                .attr('id', 'arrow-default')
+                .attr('viewBox', '0 -5 10 10')
+                .attr('refX', 18)
+                .attr('refY', 0)
+                .attr('markerWidth', 6)
+                .attr('markerHeight', 6)
+                .attr('orient', 'auto')
+                .append('path')
+                .attr('d', 'M0,-5L10,0L0,5')
+                .attr('fill', '#9099a1');
+
+            const graphGroup = svg.append('g').attr('class', 'graph-group');
+            const linkGroup = graphGroup.append('g').attr('class', 'links');
+            const nodeGroup = graphGroup.append('g').attr('class', 'nodes');
+            const labelGroup = graphGroup.append('g').attr('class', 'labels');
+
+            const tooltip = d3.select('#graph-container')
+                .append('div')
+                .attr('class', 'tooltip')
+                .style('display', 'none');
+
+            const zoom = d3.zoom()
+                .scaleExtent([0.2, 4])
+                .on('zoom', (event) => {
+                    graphGroup.attr('transform', event.transform);
+                });
+            svg.call(zoom);
+
+            const relationColor = (relType) => {
+                const rel = String(relType || '').toUpperCase();
+                if (rel.includes('SIMILAR')) return '#5b8def';
+                if (rel.includes('RELATED')) return '#8a63d2';
+                if (rel.includes('MENTIONS')) return '#f39c12';
+                if (rel.includes('MEDIA_LINKED_VIDEO')) return '#2ecc71';
+                if (rel.includes('MEDIA_LINKED_IMAGE')) return '#f1c40f';
+                if (rel.includes('LINKS_TO_CASE')) return '#e67e22';
+                if (rel.includes('COMPUTER_REFLECTS_IDEOLOGY')) return '#e74c3c';
+                return '#9099a1';
+            };
+
+            const nodeColor = (nodeType) => {
+                const t = String(nodeType || '').toLowerCase();
+                if (t === 'image') return '#f0ad4e';
+                if (t === 'video') return '#5cb85c';
+                if (t === 'case') return '#8e44ad';
+                if (t === 'ideology') return '#e74c3c';
+                if (t === 'knowledge') return '#3498db';
+                return '#667eea';
+            };
+            
+            const simulation = d3.forceSimulation(data.nodes)
+                .force('link', d3.forceLink(data.links).id(d => d.id).distance(d => 80 + Math.min(60, (d.strength || 0.3) * 30)))
+                .force('charge', d3.forceManyBody().strength(-320))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('collision', d3.forceCollide().radius(d => 10 + Math.min(14, (d.connections || 0) * 1.2)));
+            
+            const links = linkGroup.selectAll('line')
+                .data(data.links)
+                .enter()
+                .append('line')
+                .attr('stroke', d => relationColor(d.type))
+                .attr('stroke-opacity', 0.75)
+                .attr('stroke-width', d => Math.max(1.2, Math.sqrt(d.strength || 0.3) * 2.4))
+                .attr('marker-end', 'url(#arrow-default)');
+            
+            const nodes = nodeGroup.selectAll('circle')
+                .data(data.nodes)
+                .enter()
+                .append('circle')
+                .attr('r', d => 6 + Math.min(12, (d.connections || 0) * 1.3))
+                .attr('fill', d => nodeColor(d.type))
+                .attr('stroke', '#ffffff')
+                .attr('stroke-width', 1.5)
+                .style('cursor', 'pointer')
+                .call(d3.drag()
+                    .on('start', dragstarted)
+                    .on('drag', dragged)
+                    .on('end', dragended))
+                .on('mouseover', function(event, d) {
+                    d3.select(this).attr('stroke', '#222').attr('stroke-width', 2.2);
+                    tooltip.style('display', 'block')
+                        .html(`
+                            <div><b>${d.id}</b></div>
+                            <div>类型: ${d.type || 'entity'}</div>
+                            <div>连接数: ${d.connections || 0}</div>
+                        `)
+                        .style('left', `${event.offsetX + 12}px`)
+                        .style('top', `${event.offsetY + 12}px`);
+                })
+                .on('mousemove', function(event) {
+                    tooltip.style('left', `${event.offsetX + 12}px`)
+                        .style('top', `${event.offsetY + 12}px`);
+                })
+                .on('mouseout', function() {
+                    d3.select(this).attr('stroke', '#ffffff').attr('stroke-width', 1.5);
+                    tooltip.style('display', 'none');
+                })
+                .on('click', function(event, d) {
+                    document.getElementById('searchInput').value = d.id;
+                    displayEntityDetails(d.id);
+                    loadSubgraph(d.id);
+                    fetch(`/api/query?entity=${encodeURIComponent(d.id)}`)
+                        .then(response => response.json())
+                        .then(results => displayResults(results))
+                        .catch(err => console.error('Node query error:', err));
+                });
+            
+            const labels = labelGroup.selectAll('text')
+                .data(data.nodes)
+                .enter()
+                .append('text')
+                .attr('x', 0)
+                .attr('y', 0)
+                .attr('dy', '-0.95em')
+                .attr('text-anchor', 'middle')
+                .text(d => (d.id || '').length > 14 ? `${d.id.substring(0, 14)}...` : d.id)
+                .attr('font-size', '11px')
+                .attr('font-weight', '600')
+                .attr('fill', '#2f3542')
+                .attr('pointer-events', 'none');
+            
+            simulation.on('tick', () => {
+                links
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+                
+                nodes
+                    .attr('cx', d => d.x)
+                    .attr('cy', d => d.y);
+                
+                labels
+                    .attr('x', d => d.x)
+                    .attr('y', d => d.y);
+            });
+            
+            function dragstarted(event, d) {
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+            
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+            
+            function dragended(event, d) {
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }
+        }
+        
+        // 搜索实体
+        function searchEntity() {
+            const entity = document.getElementById('searchInput').value;
+            if (!entity) return;
+            
+            fetch(`/api/query?entity=${encodeURIComponent(entity)}`)
+                .then(response => response.json())
+                .then(data => {
+                    displayResults(data);
+                    displayEntityDetails(entity);
+                    loadSubgraph(entity);
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        // 显示搜索结果
+        function displayResults(results) {
+            const container = document.getElementById('results');
+            container.innerHTML = '';
+            
+            if (results.length === 0) {
+                container.innerHTML = '<div style="color: #999;">未找到相关实体</div>';
+                return;
+            }
+            
+            results.forEach(result => {
+                const item = document.createElement('div');
+                item.className = 'result-item';
+                const mediaType = result.media || result.media_type || 'N/A';
+                const mediaUrl = result.clip_path || result.clip_url || result.media_url || result.path || result.source_file || '';
+                const isVideo = String(mediaType).toLowerCase() === 'video' && !!mediaUrl;
+                item.innerHTML = `
+                    <div class="entity-name">${escapeHtml(result.entity)}</div>
+                    <div class="relation">关系: ${escapeHtml(result.relation)}</div>
+                    <div class="media-info">媒体: ${escapeHtml(mediaType)}</div>
+                    ${isVideo ? `
+                        <div class="media-info">视频链接: ${escapeHtml(mediaUrl)}</div>
+                        <video controls style="width:100%; margin-top:8px; max-height:220px; border-radius:4px;">
+                            <source src="${mediaUrl}" type="video/mp4">
+                            您的浏览器不支持视频标签。
+                        </video>
+                    ` : ''}
+                `;
+                container.appendChild(item);
+            });
+        }
+
+        function renderCharts(charts) {
+            const container = document.getElementById('graph-charts');
+            const relation = charts.relation_distribution || {};
+            const media = charts.media_distribution || {};
+
+            const relationItems = Object.entries(relation)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8)
+                .map(([k, v]) => `<div>${escapeHtml(k)}: <b>${v}</b></div>`)
+                .join('');
+            const mediaItems = Object.entries(media)
+                .sort((a, b) => b[1] - a[1])
+                .map(([k, v]) => `<div>${escapeHtml(k)}: <b>${v}</b></div>`)
+                .join('');
+
+            container.innerHTML = `
+                <div style="font-weight:600; margin-bottom:6px;">搜索相关子图统计</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:12px;">
+                    <div><div style="margin-bottom:4px; color:#555;">关系分布</div>${relationItems || '<div>暂无</div>'}</div>
+                    <div><div style="margin-bottom:4px; color:#555;">媒体分布</div>${mediaItems || '<div>暂无</div>'}</div>
+                </div>
+            `;
+        }
+
+        async function uploadAndIngest() {
+            const input = document.getElementById('mediaUploadInput');
+            const status = document.getElementById('uploadStatus');
+            if (!input.files || input.files.length === 0) {
+                status.textContent = '请先选择图片或视频文件';
+                return;
+            }
+            const file = input.files[0];
+            status.textContent = '上传中...';
+
+            const form = new FormData();
+            form.append('file', file);
+
+            try {
+                const uploadResp = await fetch('/api/upload_media', { method: 'POST', body: form });
+                const uploadData = await uploadResp.json();
+                if (!uploadResp.ok) {
+                    status.textContent = `上传失败: ${uploadData.error || 'unknown'}`;
+                    return;
+                }
+
+                status.textContent = '解析并增量入图中...';
+                const ingestResp = await fetch('/api/ingest_media', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ relative_path: uploadData.relative_path })
+                });
+                const ingestData = await ingestResp.json();
+                if (!ingestResp.ok) {
+                    status.textContent = `入图失败: ${ingestData.error || 'unknown'}`;
+                    return;
+                }
+
+                status.textContent = `完成: ${ingestData.summary || '已更新图谱'}`;
+                const q = document.getElementById('searchInput').value;
+                if (q) {
+                    loadSubgraph(q);
+                }
+            } catch (err) {
+                status.textContent = `操作失败: ${err}`;
+            }
+        }
+        
+        // 显示实体详情
+        function displayEntityDetails(entity) {
+            const container = document.getElementById('entityDetails');
+            container.innerHTML = `<div style="color: #666;">加载中...</div>`;
+            
+            fetch(`/api/query_advanced?entity=${encodeURIComponent(entity)}`)
+                .then(response => response.json())
+                .then(data => {
+                    container.innerHTML = '';
+                    
+                    // 显示相似实体
+                    if (data.similar.length > 0) {
+                        const similarSection = document.createElement('div');
+                        similarSection.className = 'section';
+                        similarSection.innerHTML = '<h3>相似实体</h3>';
+                        
+                        data.similar.forEach(item => {
+                            const tag = document.createElement('div');
+                            tag.className = 'entity-tag';
+                            tag.innerText = item.entity;
+                            similarSection.appendChild(tag);
+                        });
+                        
+                        container.appendChild(similarSection);
+                    }
+                    
+                    // 显示相关实体
+                    if (data.related.length > 0) {
+                        const relatedSection = document.createElement('div');
+                        relatedSection.className = 'section';
+                        relatedSection.innerHTML = '<h3>相关实体</h3>';
+                        
+                        data.related.forEach(item => {
+                            const tag = document.createElement('div');
+                            tag.className = 'entity-tag';
+                            tag.innerText = item.entity;
+                            relatedSection.appendChild(tag);
+                        });
+                        
+                        container.appendChild(relatedSection);
+                    }
+
+                    // 显示教学推荐（Phase4.5: 可解释推理结果）
+                    if (data.recommendations && data.recommendations.length > 0) {
+                        const recSection = document.createElement('div');
+                        recSection.className = 'section';
+                        recSection.innerHTML = '<h3>教学推荐</h3>';
+
+                        data.recommendations.forEach(item => {
+                            const card = document.createElement('div');
+                            card.className = 'recommend-card';
+
+                            const viaHint = item.via_entity ? ` | 通过: ${item.via_entity}` : '';
+                            const hopHint = item.hop ? ` | 跳数: ${item.hop}` : '';
+                            const stageHint = (item.stage_tags || []).length ? ` | 学段: ${(item.stage_tags || []).join('/')}` : '';
+                            const courseHint = (item.course_tags || []).length ? ` | 课程: ${(item.course_tags || []).slice(0, 3).join('/')}` : '';
+
+                            card.innerHTML = `
+                                <div class="recommend-title">${item.entity || '未命名推荐'}（评分: ${item.score ?? 0}）</div>
+                                <div class="recommend-meta">关系: ${item.relation || 'UNKNOWN'}${viaHint}${hopHint}${stageHint}${courseHint}</div>
+                                <div class="recommend-meta">理由: ${item.reason || '无'}</div>
+                                <div class="recommend-risk">风险: ${item.risk_note || '风险可控'}</div>
+                                <div class="recommend-suggest">建议: ${item.suggested_use || '可直接用于课堂推荐'}</div>
+                            `;
+                            recSection.appendChild(card);
+                        });
+
+                        container.appendChild(recSection);
+                    }
+                    
+                    // 显示视频
+                    if (data.videos.length > 0) {
+                        const videoSection = document.getElementById('videoPlayer');
+                        videoSection.innerHTML = '';
+                        
+                        data.videos.forEach(video => {
+                            const videoItem = document.createElement('div');
+                            videoItem.className = 'video-item';
+                            const videoSrc = video.clip_path || video.clip_url || video.media_url || video.path || '';
+                            videoItem.innerHTML = `
+                                <h4>${video.name}</h4>
+                                <p>${video.caption}</p>
+                                <video controls>
+                                    <source src="${videoSrc}" type="video/mp4">
+                                    您的浏览器不支持视频标签。
+                                </video>
+                            `;
+                            videoSection.appendChild(videoItem);
+                        });
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    container.innerHTML = `<div style="color: red;">加载失败</div>`;
+                });
+        }
+        
+        // 更新统计信息
+        function updateStats(stats) {
+            const container = document.getElementById('stats');
+            container.innerHTML = `
+                <div class="stats">
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-value">${stats.total_nodes}</div>
+                            <div class="stat-label">实体数量</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">${stats.total_edges}</div>
+                            <div class="stat-label">关系数量</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', initializeGraph);
+    </script>
+</body>
+</html>
+'''
