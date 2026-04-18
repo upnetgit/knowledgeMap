@@ -13,6 +13,7 @@ import logging
 import ast
 import subprocess
 from pathlib import Path
+import re
 
 # 配置日志
 logging.basicConfig(
@@ -50,6 +51,50 @@ def _load_entities_from_datamain(config_path: str):
     computer_entities = [str(item).strip() for item in computer_entities if str(item).strip()]
     ideology_entities = [str(item).strip() for item in ideology_entities if str(item).strip()]
     return computer_entities, ideology_entities
+
+
+def _parse_term_list(value: str):
+    if not value:
+        return []
+    parts = re.split(r'[,，;；\n]+', value)
+    return [item.strip() for item in parts if item and item.strip()]
+
+
+def _load_terms_from_file(file_path: str) -> list:
+    """从txt白名单文件读取短语，文件不存在/为空时返回空列表。"""
+    if not file_path:
+        return []
+    path = Path(file_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    if not path.exists() or not path.is_file():
+        return []
+
+    try:
+        content = path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return []
+
+    terms = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        terms.extend(_parse_term_list(line))
+    return terms
+
+
+def _merge_terms(*term_lists) -> list:
+    merged = []
+    seen = set()
+    for term_list in term_lists:
+        for item in term_list or []:
+            term = str(item).strip()
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            merged.append(term)
+    return merged
 
 
 def _run_video_preprocess(args) -> None:
@@ -194,6 +239,14 @@ def main():
         default='zh',
         help='语言选择 (默认: zh)'
     )
+
+    parser.add_argument(
+        '--device-mode',
+        type=str,
+        choices=['auto', 'cpu', 'cuda'],
+        default=os.getenv('DEVICE_MODE', 'auto'),
+        help='设备模式 (auto/cpu/cuda，默认: auto)'
+    )
     
     parser.add_argument(
         '--computer-entities',
@@ -332,6 +385,77 @@ def main():
         help='禁用 TDEN 检索模型'
     )
 
+    parser.add_argument(
+        '--enable-selective-expansion',
+        action='store_true',
+        help='启用有选择的节点扩展（默认关闭）'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-terms',
+        type=str,
+        default='',
+        help='兼容旧参数：允许扩展为新思政节点的短语白名单，用逗号/分号分隔'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-computer-terms',
+        type=str,
+        default='',
+        help='允许扩展为新计算机知识点的短语白名单，用逗号/分号分隔'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-ideology-terms',
+        type=str,
+        default='',
+        help='允许扩展为新思政元素的短语白名单，用逗号/分号分隔'
+    )
+
+
+    parser.add_argument(
+        '--selective-expansion-source-scope',
+        type=str,
+        choices=['caption', 'ocr', 'both', 'caption+ocr'],
+        default='both',
+        help='扩展时允许使用的来源范围 (默认: both)'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-min-support',
+        type=int,
+        default=1,
+        help='短语被采纳为新节点的最低证据数 (默认: 1)'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-min-score',
+        type=float,
+        default=0.55,
+        help='白名单短语被采纳的最低语义分数 (默认: 0.55)'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-max-new-ideology',
+        type=int,
+        default=20,
+        help='最多新增多少个思政节点 (默认: 20)'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-max-new-computer',
+        type=int,
+        default=20,
+        help='最多新增多少个计算机知识点节点 (默认: 20)'
+    )
+
+    parser.add_argument(
+        '--selective-expansion-max-new-total',
+        type=int,
+        default=20,
+        help='最多新增多少个选择性扩展节点总数 (默认: 20)'
+    )
+
     args = parser.parse_args()
     
     # 验证数据目录
@@ -357,17 +481,58 @@ def main():
         
         # 创建构建器
         use_xmodaler = not args.no_xmodaler_video and args.use_xmodaler_video
+        
+        # 从命令行参数和自动检测的txt文件读取扩展白名单
+        project_root = Path(__file__).resolve().parent
+        default_computer_terms_file = project_root / 'data' / 'computer_terms_whitelist.txt'
+        default_ideology_terms_file = project_root / 'data' / 'ideology_terms_whitelist.txt'
+        
+        legacy_terms = _merge_terms(
+            _parse_term_list(args.selective_expansion_terms),
+            _load_terms_from_file(str(default_ideology_terms_file)),
+        )
+        computer_terms = _merge_terms(
+            _parse_term_list(args.selective_expansion_computer_terms),
+            _load_terms_from_file(str(default_computer_terms_file)),
+        )
+        ideology_terms = _merge_terms(
+            _parse_term_list(args.selective_expansion_ideology_terms),
+            _load_terms_from_file(str(default_ideology_terms_file)),
+            legacy_terms,
+        )
+        
+        # 自动启用选择性扩展（如果检测到文件）
+        enable_auto_expansion = default_computer_terms_file.exists() or default_ideology_terms_file.exists()
+        if enable_auto_expansion:
+            logger.info(f"自动检测到扩展白名单文件，自动启用选择性扩展")
+            if default_computer_terms_file.exists():
+                logger.info(f"  - 计算机知识点白名单: {default_computer_terms_file}")
+            if default_ideology_terms_file.exists():
+                logger.info(f"  - 思政元素白名单: {default_ideology_terms_file}")
+            args.enable_selective_expansion = True
+
         builder = KGBuilder(
             neo4j_uri=args.neo4j_uri,
             user=args.neo4j_user,
             password=args.neo4j_password,
             database=args.neo4j_database,
             language=args.language,
+            device_mode=args.device_mode,
             relation_model_dir=args.relation_model_dir,
             relation_threshold=max(0.0, min(1.0, float(args.relation_threshold))),
             enable_relation_rerank=not args.disable_relation_rerank,
             use_xmodaler_video=use_xmodaler,
             xmodaler_model_type=args.xmodaler_model_type,
+            enable_selective_node_expansion=args.enable_selective_expansion,
+            selective_expansion_terms=legacy_terms,
+            selective_expansion_computer_terms=computer_terms,
+            selective_expansion_ideology_terms=ideology_terms,
+            selective_expansion_source_scope=args.selective_expansion_source_scope,
+            selective_expansion_min_support=max(1, int(args.selective_expansion_min_support)),
+            selective_expansion_min_score=max(0.0, min(1.0, float(args.selective_expansion_min_score))),
+            selective_expansion_max_new_total=max(0, int(args.selective_expansion_max_new_total)),
+            selective_expansion_max_new_computer=max(0, int(args.selective_expansion_max_new_computer)),
+            selective_expansion_max_new_ideology=max(0, int(args.selective_expansion_max_new_ideology)),
         )
         
         logger.info(f"数据目录: {args.data_dir}")
@@ -375,11 +540,23 @@ def main():
         logger.info(f"处理图像: {not args.skip_images}")
         logger.info(f"处理视频: {not args.skip_videos}")
         logger.info(f"语言: {args.language}")
+        logger.info(f"设备模式: {args.device_mode}")
         logger.info(f"Neo4j数据库: {args.neo4j_database}")
         logger.info(f"匹配TopK: {args.match_top_k}")
         logger.info(f"语义阈值: {args.semantic_threshold}")
         logger.info(f"关系重排: {not args.disable_relation_rerank}")
         logger.info(f"关系阈值: {args.relation_threshold}")
+        logger.info(f"选择性节点扩展: {args.enable_selective_expansion}")
+        if args.enable_selective_expansion:
+            logger.info(f"旧版思政白名单数量: {len(legacy_terms)}")
+            logger.info(f"计算机白名单数量: {len(computer_terms)}")
+            logger.info(f"思政白名单数量: {len(ideology_terms)}")
+            logger.info(f"扩展来源范围: {args.selective_expansion_source_scope}")
+            logger.info(f"最小证据数: {args.selective_expansion_min_support}")
+            logger.info(f"最小语义分数: {args.selective_expansion_min_score}")
+            logger.info(f"最大新增总节点: {args.selective_expansion_max_new_total}")
+            logger.info(f"最大新增计算机节点: {args.selective_expansion_max_new_computer}")
+            logger.info(f"最大新增思政节点: {args.selective_expansion_max_new_ideology}")
         logger.info(f"视频预处理: {args.video_preprocess}")
         if args.video_preprocess:
             logger.info(f"视频预处理修复: {args.video_preprocess_fix}")
