@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import importlib
+from difflib import SequenceMatcher
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from datetime import datetime
@@ -45,11 +46,22 @@ class KGBuilder:
                  password: str = "password",
                  database: str = "neo4j",
                  language: str = "zh",
+                 device_mode: str = "auto",
                  relation_model_dir: Optional[str] = None,
                  relation_threshold: float = 0.55,
                  enable_relation_rerank: bool = True,
                  use_xmodaler_video: bool = True,
-                 xmodaler_model_type: str = "tdconved"):
+                 xmodaler_model_type: str = "tdconved",
+                 enable_selective_node_expansion: bool = False,
+                 selective_expansion_terms: Optional[List[str]] = None,
+                 selective_expansion_computer_terms: Optional[List[str]] = None,
+                 selective_expansion_ideology_terms: Optional[List[str]] = None,
+                 selective_expansion_source_scope: str = "both",
+                 selective_expansion_min_support: int = 1,
+                 selective_expansion_min_score: float = 0.55,
+                 selective_expansion_max_new_total: int = 20,
+                 selective_expansion_max_new_computer: int = 20,
+                 selective_expansion_max_new_ideology: int = 20):
         """
         初始化知识图谱构建器
 
@@ -67,6 +79,7 @@ class KGBuilder:
         self.password = password
         self.database = database or "neo4j"
         self.language = language
+        self.device_mode = str(device_mode or "auto").strip().lower()
         
         # 初始化处理器
         try:
@@ -93,23 +106,54 @@ class KGBuilder:
             nlp = None
         
         self.text_processor = TextProcessor(nlp_model=nlp)
-        self.image_processor = ImageProcessor()
-        self.video_processor = VideoProcessor()
+        self.image_processor = ImageProcessor(device_mode=self.device_mode)
+        self.video_processor = VideoProcessor(device_mode=self.device_mode)
         self.caption_generator = CaptionGenerator(
             use_ocr=True, 
             ocr_lang='chi_sim+eng', 
             use_asr=True,
             use_xmodaler_video=use_xmodaler_video,
-            xmodaler_model_type=xmodaler_model_type
+            xmodaler_model_type=xmodaler_model_type,
+            device_mode=self.device_mode,
         )
-        self.semantic_scorer = SemanticScorer()
+        self.semantic_scorer = SemanticScorer(device_mode=self.device_mode)
+        if self.semantic_scorer.available:
+            logger.info(f"语义模型已启用: {self.semantic_scorer.model_dir}")
+        else:
+            logger.warning("语义模型未启用，已降级为词面匹配（请检查 BERT_cn/bert-base-chinese）")
         self.enable_relation_rerank = bool(enable_relation_rerank)
         self.relation_threshold = max(0.0, min(1.0, float(relation_threshold)))
         self.relation_reranker = RelationReranker(
             model_dir=relation_model_dir,
             threshold=self.relation_threshold,
+            device_mode=self.device_mode,
         ) if self.enable_relation_rerank else None
-        
+        if self.relation_reranker is not None:
+            if self.relation_reranker.available:
+                logger.info(f"关系重排模型已启用: {self.relation_reranker.model_dir}")
+            else:
+                logger.warning("关系重排模型未启用，已回退规则策略（请检查 relation_model_dir）")
+
+        # 有选择的节点扩展：默认关闭，避免图谱无节制增长
+        self.enable_selective_node_expansion = bool(enable_selective_node_expansion)
+        self.selective_expansion_catalog = {
+            'computer_science': self._normalize_term_list(selective_expansion_computer_terms),
+            'ideology': self._normalize_term_list(selective_expansion_ideology_terms),
+        }
+        legacy_terms = self._normalize_term_list(selective_expansion_terms)
+        if legacy_terms and not self.selective_expansion_catalog['ideology']:
+            # 兼容旧参数：未显式分类时，沿用为思政扩展候选
+            self.selective_expansion_catalog['ideology'] = legacy_terms
+        self.selective_expansion_terms = legacy_terms  # 保留兼容字段，外部日志/调试可见
+        self.selective_expansion_source_scope = str(selective_expansion_source_scope or 'both').strip().lower()
+        self.selective_expansion_min_support = max(1, int(selective_expansion_min_support))
+        self.selective_expansion_min_score = max(0.0, min(1.0, float(selective_expansion_min_score)))
+        self.selective_expansion_max_new_total = max(0, int(selective_expansion_max_new_total))
+        self.selective_expansion_max_new_computer = max(0, int(selective_expansion_max_new_computer))
+        self.selective_expansion_max_new_ideology = max(0, int(selective_expansion_max_new_ideology))
+        self._selective_expanded_entities = set()
+        self._selective_expanded_counts = defaultdict(int)
+
         # 记录使用的图像字幕模型
         self.image_caption_model = "tden" if self.caption_generator.tden_image_model else "blip"
         logger.info(f"使用图像字幕模型: {self.image_caption_model}")
@@ -125,6 +169,7 @@ class KGBuilder:
         self.relations = defaultdict(list)
         self.case_records: Dict[str, Dict] = {}
         self.media_records: Dict[str, Dict] = {}
+        self.invalid_media_records: List[Dict] = []
         
         # 预定义实体类型
         self.entity_types = {
@@ -151,6 +196,34 @@ class KGBuilder:
         relation_type = re.sub(r'[^0-9A-Za-z_]+', '_', relation_type)
         relation_type = relation_type.upper().strip('_')
         return relation_type or 'CONNECTED'
+
+    def _node_labels(self, node_name: str, attrs: Dict) -> List[str]:
+        """
+        获取节点的Neo4j标签列表
+        优先使用存储在attrs中的labels，否则根据type推导
+        """
+        if 'labels' in attrs and attrs['labels']:
+            labels = attrs['labels']
+            if isinstance(labels, list):
+                return labels
+            elif isinstance(labels, str):
+                return [labels]
+
+        # 根据type推导标签
+        node_type = attrs.get('type', attrs.get('node_type', 'entity'))
+        base_label = 'Entity'
+
+        type_to_labels = {
+            'computer_science': ['Entity', 'KnowledgePoint'],
+            'ideology': ['Entity', 'IdeologyElement'],
+            'teaching_case': ['Entity', 'TeachingCase'],
+            'media_image': ['Entity', 'Media', 'Image'],
+            'media_video': ['Entity', 'Media', 'Video'],
+        }
+
+        return type_to_labels.get(str(node_type).strip(), [base_label])
+
+    # ...existing code...
 
     def _relation_score(self, relation_type: str) -> float:
         relation_type = self._normalize_relation_type(relation_type)
@@ -320,7 +393,48 @@ class KGBuilder:
             return ['Entity', 'IdeologyElement']
         if node_type == 'computer_science':
             return ['Entity', 'KnowledgePoint']
+
+        # 兜底：根据媒体类型和预置实体类型推断标签，减少 schema 漂移。
+        media_type = str(attrs.get('media_type', '') or '').lower()
+        if media_type == 'video':
+            return ['Entity', 'Media', 'Video']
+        if media_type == 'image':
+            return ['Entity', 'Media', 'Image']
+
+        if node_name in set(self.entity_types.get('computer_science', []) or []):
+            return ['Entity', 'KnowledgePoint']
+        if node_name in set(self.entity_types.get('ideology', []) or []):
+            return ['Entity', 'IdeologyElement']
         return ['Entity']
+
+    def _enrich_dimension_node_properties(self) -> None:
+        """
+        为知识点/思政节点补充教学案例与媒体属性，便于教学侧检索
+        注意：图像已不再是节点，故不需要收集image_names，但保留videos收集
+        """
+        for node_name, attrs in list(self.graph.nodes(data=True)):
+            labels = set(self._node_labels(node_name, attrs))
+            if 'KnowledgePoint' not in labels and 'IdeologyElement' not in labels:
+                continue
+
+            case_names = set(str(item).strip() for item in attrs.get('teaching_cases', []) if str(item).strip())
+            video_names = set(str(item).strip() for item in attrs.get('videos', []) if str(item).strip())
+
+            neighbors = set(self.graph.successors(node_name)) | set(self.graph.predecessors(node_name))
+            for neighbor in neighbors:
+                neighbor_attrs = self.graph.nodes[neighbor]
+                neighbor_labels = set(self._node_labels(neighbor, neighbor_attrs))
+                if 'TeachingCase' in neighbor_labels:
+                    case_names.add(str(neighbor))
+                if 'Video' in neighbor_labels:
+                    video_names.add(str(neighbor))
+
+            attrs['teaching_cases'] = sorted(case_names)
+            attrs['videos'] = sorted(video_names)
+            attrs['teaching_case_count'] = len(attrs['teaching_cases'])
+            attrs['video_count'] = len(attrs['videos'])
+            # 图像数和媒体计数已从属性中获取
+            attrs['media_count'] = attrs.get('image_count', 0) + attrs['video_count']
 
     def _get_synonym_dict(self) -> Dict[str, List[str]]:
         """获取中文同义词词典。"""
@@ -379,6 +493,171 @@ class KGBuilder:
             return True
         return entity_name.strip() in allowed
 
+    @staticmethod
+    def _normalize_term_text(term: str) -> str:
+        text = re.sub(r'\s+', '', str(term or '').strip())
+        return text.strip('，。；：,:;!?！？、（）()[]【】"\'“”')
+
+    def _normalize_term_list(self, terms) -> List[str]:
+        if not terms:
+            return []
+        if isinstance(terms, str):
+            raw_terms = re.split(r'[,，;；\n]+', terms)
+        elif isinstance(terms, (list, tuple, set)):
+            raw_terms = list(terms)
+        else:
+            raw_terms = [terms]
+
+        normalized = []
+        seen = set()
+        for term in raw_terms:
+            cleaned = self._normalize_term_text(term)
+            if cleaned and cleaned not in seen:
+                normalized.append(cleaned)
+                seen.add(cleaned)
+        return normalized
+
+    def _source_scope_allows(self, source_kind: str) -> bool:
+        scope = self.selective_expansion_source_scope
+        if scope in ('both', 'all', 'caption+ocr'):
+            return True
+        return scope == str(source_kind or '').strip().lower()
+
+    @staticmethod
+    def _compact_text(text: str) -> str:
+        return re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]+', '', str(text or '').strip())
+
+    def _selective_candidate_score(self, candidate: str, source_text: str, extra_ocr_text: str = '') -> float:
+        candidate = self._normalize_term_text(candidate)
+        if not candidate:
+            return 0.0
+
+        combined = self._normalize_term_text(f"{source_text} {extra_ocr_text}".strip())
+        if not combined:
+            return 0.0
+
+        compact_candidate = self._compact_text(candidate)
+        compact_source = self._compact_text(combined)
+
+        if compact_candidate and compact_candidate in compact_source:
+            return 1.0
+
+        chinese_candidate = ''.join(ch for ch in candidate if '\u4e00' <= ch <= '\u9fff')
+        chinese_source = ''.join(ch for ch in combined if '\u4e00' <= ch <= '\u9fff')
+        if chinese_candidate and chinese_candidate in chinese_source:
+            return 0.95
+
+        ratio_score = SequenceMatcher(None, compact_candidate, compact_source).ratio()
+        chinese_ratio = SequenceMatcher(None, chinese_candidate, chinese_source).ratio() if chinese_candidate and chinese_source else 0.0
+
+        semantic_score = 0.0
+        try:
+            semantic_score = float(self.semantic_scorer.similarity(combined, candidate)) if self.semantic_scorer else 0.0
+        except Exception:
+            semantic_score = 0.0
+
+        return max(ratio_score, chinese_ratio, semantic_score)
+
+    def _can_expand_more(self, target_type: str) -> bool:
+        if self.selective_expansion_max_new_total > 0 and len(self._selective_expanded_entities) >= self.selective_expansion_max_new_total:
+            return False
+        if target_type == 'computer_science' and self.selective_expansion_max_new_computer > 0:
+            return self._selective_expanded_counts[target_type] < self.selective_expansion_max_new_computer
+        if target_type == 'ideology' and self.selective_expansion_max_new_ideology > 0:
+            return self._selective_expanded_counts[target_type] < self.selective_expansion_max_new_ideology
+        return True
+
+    def _promotion_target_type(self, target_type: str) -> Tuple[str, str]:
+        if target_type == 'computer_science':
+            return 'computer_science', 'KnowledgePoint'
+        return 'ideology', 'IdeologyElement'
+
+    def _expand_selective_entities(self,
+                                   source_name: str,
+                                   source_kind: str,
+                                   source_text: str,
+                                   known_entities: Dict[str, Dict],
+                                   media_type: str,
+                                   media_path: str,
+                                   extra_ocr_text: str = '') -> List[str]:
+        """将白名单中的短语按需提升为思政/计算机节点。"""
+        if not self.enable_selective_node_expansion:
+            return []
+
+        if not self._source_scope_allows(source_kind):
+            return []
+
+        expanded = []
+
+        for target_type, terms in self.selective_expansion_catalog.items():
+            if not terms or not self._can_expand_more(target_type):
+                continue
+
+            for term in terms:
+                if not self._can_expand_more(target_type):
+                    break
+                if not term or term in known_entities or term in self._allowed_entity_set() or term in self._selective_expanded_entities:
+                    continue
+
+                score = self._selective_candidate_score(term, source_text, extra_ocr_text)
+                support = 0
+                if self._normalize_term_text(term) in self._normalize_term_text(source_text):
+                    support += 1
+                if extra_ocr_text and self._normalize_term_text(term) in self._normalize_term_text(extra_ocr_text):
+                    support += 1
+                if score >= self.selective_expansion_min_score:
+                    support += 1
+
+                if support < self.selective_expansion_min_support:
+                    continue
+
+                node_type, node_label = self._promotion_target_type(target_type)
+                node_attrs = {
+                    'type': node_type,
+                    'labels': ['Entity', node_label],
+                    'source': f'{source_name}::selective_expansion',
+                    'sources': {source_name},
+                    'keywords': [term],
+                    'count': support,
+                    'selective_expanded': True,
+                    'selective_source_kind': source_kind,
+                    'selective_target_type': target_type,
+                    'media_type': 'text',
+                    'promotion_evidence': source_text[:500],
+                }
+                self.graph.add_node(term, **node_attrs)
+                self.entity_types.setdefault(node_type, [])
+                if term not in self.entity_types[node_type]:
+                    self.entity_types[node_type].append(term)
+                known_entities[term] = {
+                    'type': node_type,
+                    'source': f'{source_name}::selective_expansion',
+                    'sources': {source_name},
+                    'keywords': {term},
+                    'count': support,
+                    'promoted': True,
+                }
+                self._selective_expanded_entities.add(term)
+                self._selective_expanded_counts[target_type] += 1
+
+                relation_type = 'MEDIA_LINKED_IMAGE' if media_type == 'image' else 'MEDIA_LINKED_VIDEO'
+                self.graph.add_edge(
+                    term,
+                    source_name,
+                    relation=relation_type,
+                    similarity=score if score > 0 else 1.0,
+                    caption=source_text,
+                    ocr_text=extra_ocr_text or source_text,
+                    media_path=media_path,
+                    media_type=media_type,
+                )
+                self.relations[relation_type].append((term, source_name, score if score > 0 else 1.0))
+                expanded.append(term)
+
+        if expanded:
+            logger.info(f"[{source_name}] 有选择扩展节点: {expanded}")
+        return expanded
+
     def _infer_stage_tags(self, text: str) -> List[str]:
         """从教学文本中推断学段标签。"""
         text = text or ""
@@ -430,6 +709,120 @@ class KGBuilder:
         except Exception as e:
             logger.error(f"数据库连接测试失败: {str(e)}")
             return False
+
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def _data_root(self) -> Path:
+        return self._project_root() / 'data'
+
+    def _normalize_media_path(self, path_value: str) -> str:
+        """将媒体路径规范为相对 data/ 的可移植路径。"""
+        if not path_value:
+            return ''
+
+        raw = str(path_value).strip()
+        if raw.startswith('/media/'):
+            return raw
+
+        p = Path(raw)
+        data_root = self._data_root().resolve()
+
+        candidates = []
+        if p.is_absolute():
+            candidates.append(p.resolve())
+        else:
+            candidates.append((self._project_root() / p).resolve())
+            candidates.append((data_root / p).resolve())
+
+        for candidate in candidates:
+            try:
+                relative = candidate.relative_to(data_root)
+                return relative.as_posix()
+            except Exception:
+                continue
+
+        return raw.replace('\\', '/')
+
+    def _media_url_from_path(self, path_value: str) -> str:
+        normalized = self._normalize_media_path(path_value)
+        if not normalized:
+            return ''
+        if normalized.startswith('/media/'):
+            return normalized
+        return f"/media/{normalized}"
+
+    def _resolve_persisted_media_fields(self, attrs: Dict) -> Dict[str, str]:
+        """入库时统一补齐媒体路径字段；播放优先分段 clip。"""
+        source_path = self._normalize_media_path(attrs.get('path', ''))
+        clip_path = self._normalize_media_path(attrs.get('clip_path', ''))
+
+        clip_url = attrs.get('clip_url', '') or (self._media_url_from_path(clip_path) if clip_path else '')
+        source_url = attrs.get('media_url', '') or (self._media_url_from_path(source_path) if source_path else '')
+
+        # 播放侧统一优先 clip
+        preferred_relative = clip_path or source_path
+        preferred_url = clip_url or source_url or (self._media_url_from_path(preferred_relative) if preferred_relative else '')
+
+        return {
+            'path': source_path,
+            'clip_path': clip_path,
+            'clip_url': clip_url,
+            'relative_path': preferred_relative,
+            'media_url': preferred_url,
+        }
+
+    def _resolve_existing_clip(self, video_path: str) -> Tuple[str, str]:
+        """若已存在预处理分段视频，返回其相对路径和URL。"""
+        normalized_video = self._normalize_media_path(video_path)
+        if not normalized_video:
+            return '', ''
+
+        stem = Path(normalized_video).stem
+        clip_dir = self._data_root() / 'clips'
+        clip_candidates = [
+            clip_dir / f"{stem}_clip.mp4",
+            clip_dir / f"{stem}.mp4",
+        ]
+
+        for candidate in clip_candidates:
+            if candidate.exists() and candidate.is_file():
+                rel = self._normalize_media_path(str(candidate))
+                return rel, self._media_url_from_path(rel)
+        return '', ''
+
+    @staticmethod
+    def _semantic_text_from_name(name: str) -> str:
+        stem = Path(str(name or '')).stem
+        chunks = re.split(r'[\s_\-]+', stem)
+        return ' '.join([item for item in chunks if len(item) >= 2])
+
+    def _valid_image_item(self, img_name: str, img_data: Dict) -> bool:
+        path = str(img_data.get('path') or '')
+        metadata = img_data.get('metadata') or {}
+        if not path or not os.path.exists(path):
+            self.invalid_media_records.append({'name': img_name, 'type': 'image', 'reason': 'missing_path'})
+            return False
+        width, height = metadata.get('size', (0, 0)) if isinstance(metadata.get('size'), (tuple, list)) else (0, 0)
+        if int(width or 0) <= 0 or int(height or 0) <= 0:
+            self.invalid_media_records.append({'name': img_name, 'type': 'image', 'reason': 'invalid_size'})
+            return False
+        return True
+
+    def _valid_video_item(self, video_name: str, video_data: Dict) -> bool:
+        path = str(video_data.get('path') or '')
+        metadata = video_data.get('metadata') or {}
+        if not path or not os.path.exists(path):
+            self.invalid_media_records.append({'name': video_name, 'type': 'video', 'reason': 'missing_path'})
+            return False
+        frame_count = int(metadata.get('frame_count') or 0)
+        fps = float(metadata.get('fps') or 0.0)
+        width = int(metadata.get('width') or 0)
+        height = int(metadata.get('height') or 0)
+        if frame_count <= 0 or fps <= 0 or width <= 0 or height <= 0:
+            self.invalid_media_records.append({'name': video_name, 'type': 'video', 'reason': 'invalid_metadata'})
+            return False
+        return True
     
     def _load_known_entities(self, txt_dir: str) -> Dict[str, Dict]:
         """
@@ -678,55 +1071,55 @@ class KGBuilder:
         return max(0.0, min(1.0, score))
 
     def _build_cross_modal_links(self, output_dir: str, threshold: float = 0.55, top_k: int = 3):
-        """基于视觉特征建立图像-视频跨模态链接。"""
-        image_items = []
+        """
+        基于视觉特征建立跨模态链接（仅视频）
+        因为图像不再作为节点存储，所以只处理视频间的关联
+        """
         video_items = []
 
         for node_name, attrs in self.graph.nodes(data=True):
+            if attrs.get('media_type') != 'video':
+                continue
+            
             feats = attrs.get('features')
             if feats is None:
                 continue
+            
+            try:
+                frame_feats = np.asarray(feats, dtype=np.float32)
+                pooled = frame_feats.mean(axis=0) if frame_feats.ndim > 1 else frame_feats.reshape(-1)
+                video_items.append((node_name, pooled.reshape(-1)))
+            except Exception:
+                continue
 
-            if attrs.get('media_type') == 'image':
-                image_items.append((node_name, np.asarray(feats, dtype=np.float32).reshape(-1)))
-            elif attrs.get('media_type') == 'video':
-                try:
-                    frame_feats = np.asarray(feats, dtype=np.float32)
-                    pooled = frame_feats.mean(axis=0) if frame_feats.ndim > 1 else frame_feats.reshape(-1)
-                    video_items.append((node_name, pooled.reshape(-1)))
-                except Exception:
-                    continue
-
-        if not image_items or not video_items:
+        if len(video_items) < 2:
             return
 
         cross_relations = {}
-        for img_name, img_feat in image_items:
-            ranked = []
-            for video_name, video_feat in video_items:
-                sim = self._cosine_similarity(img_feat, video_feat)
+        for i, (video_name_1, video_feat_1) in enumerate(video_items):
+            for j, (video_name_2, video_feat_2) in enumerate(video_items):
+                if i >= j:
+                    continue
+                
+                sim = self._cosine_similarity(video_feat_1, video_feat_2)
                 if sim >= threshold:
-                    ranked.append((video_name, sim))
-            ranked.sort(key=lambda x: x[1], reverse=True)
-
-            for video_name, sim in ranked[:top_k]:
-                rel_key = f"{img_name}--{video_name}--cross"
-                cross_relations[rel_key] = {
-                    'source_media': img_name,
-                    'target_media': video_name,
-                    'relation': 'CONNECTED_BY_VISUAL',
-                    'similarity': round(float(sim), 4),
-                    'source_type': 'image',
-                    'target_type': 'video',
-                }
-                self.graph.add_edge(
-                    img_name,
-                    video_name,
-                    relation='CONNECTED_BY_VISUAL',
-                    similarity=float(sim),
-                    media_type='cross_modal',
-                )
-                self.relations['CONNECTED_BY_VISUAL'].append((img_name, video_name, float(sim)))
+                    rel_key = f"{video_name_1}--{video_name_2}--cross"
+                    cross_relations[rel_key] = {
+                        'source_media': video_name_1,
+                        'target_media': video_name_2,
+                        'relation': 'CONNECTED_BY_VISUAL',
+                        'similarity': round(float(sim), 4),
+                        'source_type': 'video',
+                        'target_type': 'video',
+                    }
+                    self.graph.add_edge(
+                        video_name_1,
+                        video_name_2,
+                        relation='CONNECTED_BY_VISUAL',
+                        similarity=float(sim),
+                        media_type='cross_modal',
+                    )
+                    self.relations['CONNECTED_BY_VISUAL'].append((video_name_1, video_name_2, float(sim)))
 
         if cross_relations:
             self._save_relations_to_json(cross_relations, os.path.join(output_dir, 'cross_modal_relations.json'))
@@ -770,15 +1163,6 @@ class KGBuilder:
 
         # 第三步补充：构建教学案例节点
         self._build_teaching_cases(known_entities, output_dir)
-
-        # 第三步补充2：构建计算机知识点 -> 思政元素关系（B方案）
-        self._build_computer_ideology_relations(output_dir)
-        
-        # 保存已知实体
-        self._save_entities_to_json(
-            known_entities,
-            os.path.join(output_dir, 'known_entities.json')
-        )
         
         # 第四步：处理图像
         img_dir = os.path.join(data_dir, 'img')
@@ -792,15 +1176,24 @@ class KGBuilder:
             logger.info("\n处理视频数据...")
             self._process_videos(video_dir, known_entities, output_dir)
 
-        # 第五步补充：建立跨模态媒体连接
+        # 第五步补充：构建计算机知识点 -> 思政元素关系（包含选择性扩展后的新节点）
+        self._build_computer_ideology_relations(output_dir)
+
+        # 保存已知实体（此时已包含选择性扩展节点）
+        self._save_entities_to_json(
+            known_entities,
+            os.path.join(output_dir, 'known_entities.json')
+        )
+
+        # 第六步补充：建立跨模态媒体连接
         self._build_cross_modal_links(output_dir)
         
-        # 第六步：存储到Neo4j
+        # 第七步：存储到Neo4j
         if self.driver:
             logger.info("\n存储到Neo4j数据库...")
             self._store_to_neo4j()
         
-        # 第七步：保存图谱统计
+        # 第八步：保存图谱统计
         self._save_kg_stats(output_dir)
         
         logger.info("\n" + "=" * 50)
@@ -811,126 +1204,139 @@ class KGBuilder:
                        img_dir: str,
                        known_entities: Dict[str, Dict],
                        output_dir: str):
-        """处理图像并建立实体关系"""
-        image_relations = {}
+        """
+        处理图像 - 生成描述，用于增强知识点和思政节点的属性
+        图像本身不存储为节点，仅作为内容来源
+        """
+        image_enrichment_records = {}  # 记录图像对节点属性的增强
         images = self.image_processor.load_images(img_dir)
         
         for img_name, img_data in images.items():
-            self.graph.add_node(img_name,
-                                type='media_image',
-                                labels=['Entity', 'Media', 'Image'],
-                                path=img_data['path'],
-                                category=img_data.get('category', 'unknown'),
-                                media_type='image',
-                                feature_backend=getattr(self.image_processor, 'feature_backend', 'unknown'),
-                                features=img_data.get('features').tolist() if isinstance(img_data.get('features'), np.ndarray) else img_data.get('features'),
-                                image_size=img_data.get('metadata', {}).get('size', ''),
-                                image_mode=img_data.get('metadata', {}).get('mode', ''),
-                                image_format=img_data.get('metadata', {}).get('format', ''))
-            self.media_records[img_name] = {
-                'name': img_name,
-                'path': img_data['path'],
-                'media_type': 'image',
-                'category': img_data.get('category', 'unknown'),
-            }
-
+            if not self._valid_image_item(img_name, img_data):
+                logger.warning(f"跳过异常图像: {img_name}")
+                continue
+            image_path = self._normalize_media_path(img_data['path'])
+            name_semantics = self._semantic_text_from_name(img_name)
+            
             # 生成图像描述
             caption = self.caption_generator.generate_image_caption(img_data['path'])
             ocr_text = self.caption_generator.recognize_text_from_image(img_data['path'])
             
             if caption:
                 logger.info(f"[{img_name}] 描述: {caption}")
+
+                enriched_text = f"{caption} {ocr_text or ''} {name_semantics}".strip()
                 
                 # 从描述提取实体
-                caption_entities = self._extract_entities_from_text(f"{caption} {ocr_text or ''}")
+                caption_entities = self._extract_entities_from_text(enriched_text)
+
+                # 有选择地扩展思政节点（默认关闭，需显式启用）
+                self._expand_selective_entities(
+                    source_name=img_name,
+                    source_kind='caption',
+                    source_text=enriched_text,
+                    known_entities=known_entities,
+                    media_type='image',
+                    media_path=image_path,
+                    extra_ocr_text=ocr_text or '',
+                )
                 
                 # 匹配到已知实体
                 matches = self._match_entities(
                     caption_entities,
                     known_entities,
-                    context_text=f"{caption} {ocr_text or ''}",
+                    context_text=enriched_text,
                     top_k=getattr(self, 'match_top_k', 12),
                     semantic_threshold=getattr(self, 'semantic_threshold', 0.45),
                 )
                 
-                # 建立关系
+                # 不创建图像节点，而是增强匹配实体的属性
                 for matched_entity, similarity in matches:
-                    relation_key = f"{matched_entity}--{img_name}"
-                    image_relations[relation_key] = {
-                        'source_entity': matched_entity,
-                        'media': img_name,
-                        'media_type': 'image',
-                        'media_path': img_data['path'],
-                        'category': img_data.get('category', 'unknown'),
-                        'caption': caption,
-                        'similarity': similarity
-                    }
+                    if not self.graph.has_node(matched_entity):
+                        continue
                     
-                    # 添加到图中
-                    self.graph.add_edge(matched_entity, img_name,
-                                      relation='MEDIA_LINKED_IMAGE',
-                                      similarity=similarity,
-                                      caption=caption,
-                                      ocr_text=ocr_text,
-                                      media_path=img_data['path'],
-                                      media_type='image')
+                    # 获取现有节点属性
+                    node_attrs = self.graph.nodes[matched_entity]
                     
-                    self.relations['MEDIA_LINKED_IMAGE'].append(
-                        (matched_entity, img_name, similarity)
-                    )
-
-                best_case = self.semantic_scorer.rank_candidates(
-                    f"{caption} {ocr_text or ''}",
-                    self.case_records,
-                    top_k=1,
-                )
-                if best_case and best_case[0]['score'] >= 0.35:
-                    case_name = best_case[0]['name']
-                    self.graph.add_edge(img_name, case_name,
-                                      relation='LINKS_TO_CASE',
-                                      similarity=float(best_case[0]['score']),
-                                      caption=caption,
-                                      media_type='image')
-                    self.relations['LINKS_TO_CASE'].append((img_name, case_name, float(best_case[0]['score'])))
-                    image_relations[f'{img_name}--{case_name}'] = {
-                        'media': img_name,
-                        'case': case_name,
-                        'media_type': 'image',
-                        'relation': 'LINKS_TO_CASE',
-                        'similarity': float(best_case[0]['score']),
+                    # 更新图像相关属性
+                    if 'image_captions' not in node_attrs:
+                        node_attrs['image_captions'] = []
+                    if 'image_ocr_texts' not in node_attrs:
+                        node_attrs['image_ocr_texts'] = []
+                    if 'image_paths' not in node_attrs:
+                        node_attrs['image_paths'] = []
+                    if 'image_count' not in node_attrs:
+                        node_attrs['image_count'] = 0
+                    
+                    # 去重后添加
+                    if caption not in node_attrs['image_captions']:
+                        node_attrs['image_captions'].append(caption)
+                    if ocr_text and ocr_text not in node_attrs['image_ocr_texts']:
+                        node_attrs['image_ocr_texts'].append(ocr_text)
+                    if image_path not in node_attrs['image_paths']:
+                        node_attrs['image_paths'].append(image_path)
+                        node_attrs['image_count'] += 1
+                    
+                    image_enrichment_records[f"{matched_entity}--{img_name}"] = {
+                        'entity': matched_entity,
+                        'image': img_name,
+                        'image_path': image_path,
                         'caption': caption,
                         'ocr_text': ocr_text,
+                        'similarity': similarity,
                     }
+                    
+                    logger.info(f"  → 增强节点 '{matched_entity}' (相似度: {similarity:.2f})")
         
-        # 保存图像关系
+        # 保存图像增强记录
         self._save_relations_to_json(
-            image_relations,
-            os.path.join(output_dir, 'image_relations.json')
+            image_enrichment_records,
+            os.path.join(output_dir, 'image_enrichment_records.json')
         )
     
     def _process_videos(self,
                        video_dir: str,
                        known_entities: Dict[str, Dict],
                        output_dir: str):
-        """处理视频并建立实体关系"""
+        """
+        处理视频并建立实体关系
+        支持 Video 节点和 VideoClip 子节点
+        """
         video_relations = {}
         videos = self.video_processor.load_videos(video_dir)
         
         for video_name, video_data in videos.items():
+            if not self._valid_video_item(video_name, video_data):
+                logger.warning(f"跳过异常视频: {video_name}")
+                continue
+            video_path = self._normalize_media_path(video_data['path'])
+            video_url = self._media_url_from_path(video_path)
+            clip_path, clip_url = self._resolve_existing_clip(video_data['path'])
+            name_semantics = self._semantic_text_from_name(video_name)
+            
+            # 创建Video节点
             self.graph.add_node(video_name,
                                 type='media_video',
                                 labels=['Entity', 'Media', 'Video'],
-                                path=video_data['path'],
+                                path=video_path,
+                                clip_path=clip_path,
+                                clip_url=clip_url,
+                                media_url=clip_url or video_url,
                                 media_type='video',
                                 feature_backend=getattr(self.video_processor.image_processor, 'feature_backend', 'unknown'),
                                 features=video_data.get('features'),
                                 fps=video_data.get('metadata', {}).get('fps', 0),
                                 frame_count=video_data.get('metadata', {}).get('frame_count', 0),
                                 width=video_data.get('metadata', {}).get('width', 0),
-                                height=video_data.get('metadata', {}).get('height', 0))
+                                height=video_data.get('metadata', {}).get('height', 0),
+                                duration=video_data.get('metadata', {}).get('duration', 0),
+                                video_clips=[])  # 关联的视频剪辑列表
+            
             self.media_records[video_name] = {
                 'name': video_name,
-                'path': video_data['path'],
+                'path': video_path,
+                'clip_path': clip_path,
+                'media_url': clip_url or video_url,
                 'media_type': 'video',
                 'metadata': video_data.get('metadata', {}),
             }
@@ -940,15 +1346,26 @@ class KGBuilder:
             
             if caption:
                 logger.info(f"[{video_name}] 描述: {caption}")
+                enriched_text = f"{caption} {name_semantics}".strip()
                 
                 # 从描述提取实体
-                caption_entities = self._extract_entities_from_text(caption)
+                caption_entities = self._extract_entities_from_text(enriched_text)
+
+                # 有选择地扩展思政节点（默认关闭，需显式启用）
+                self._expand_selective_entities(
+                    source_name=video_name,
+                    source_kind='caption',
+                    source_text=enriched_text,
+                    known_entities=known_entities,
+                    media_type='video',
+                    media_path=clip_path or video_path,
+                )
                 
                 # 匹配到已知实体
                 matches = self._match_entities(
                     caption_entities,
                     known_entities,
-                    context_text=caption,
+                    context_text=enriched_text,
                     top_k=getattr(self, 'match_top_k', 12),
                     semantic_threshold=getattr(self, 'semantic_threshold', 0.45),
                 )
@@ -960,7 +1377,9 @@ class KGBuilder:
                         'source_entity': matched_entity,
                         'media': video_name,
                         'media_type': 'video',
-                        'media_path': video_data['path'],
+                        'media_path': clip_path or video_path,
+                        'media_url': clip_url or video_url,
+                        'clip_path': clip_path,
                         'caption': caption,
                         'similarity': similarity,
                         'metadata': video_data['metadata']
@@ -971,7 +1390,9 @@ class KGBuilder:
                                       relation='MEDIA_LINKED_VIDEO',
                                       similarity=similarity,
                                       caption=caption,
-                                      media_path=video_data['path'],
+                                      media_path=clip_path or video_path,
+                                      media_url=clip_url or video_url,
+                                      clip_path=clip_path,
                                       media_type='video')
                     
                     self.relations['MEDIA_LINKED_VIDEO'].append(
@@ -979,7 +1400,7 @@ class KGBuilder:
                     )
 
                 best_case = self.semantic_scorer.rank_candidates(
-                    caption,
+                    enriched_text,
                     self.case_records,
                     top_k=1,
                 )
@@ -1007,12 +1428,17 @@ class KGBuilder:
         )
     
     def _store_to_neo4j(self):
-        """将知识图谱存储到Neo4j"""
+        """
+        将知识图谱存储到Neo4j
+        支持新的数据模型：图像作为属性，视频和视频剪辑作为节点
+        """
         if not self.driver:
             logger.warning("Neo4j驱动未初始化")
             return
         
         try:
+            # 入库前统一补齐知识点/思政节点的教学案例与媒体属性。
+            self._enrich_dimension_node_properties()
             with self.driver.session(database=self.database) as session:
                 # 清空现有数据（可选）
                 # session.run("MATCH (n) DETACH DELETE n")
@@ -1021,6 +1447,9 @@ class KGBuilder:
                 for entity_id, (entity_name, attrs) in enumerate(self.graph.nodes(data=True)):
                     labels = self._node_labels(entity_name, attrs)
                     label_clause = ":".join(labels)
+                    media_fields = self._resolve_persisted_media_fields(attrs)
+                    
+                    # 准备属性
                     props = {
                         'name': entity_name,
                         'id': entity_id,
@@ -1030,7 +1459,11 @@ class KGBuilder:
                         'summary': attrs.get('summary', ''),
                         'title': attrs.get('title', ''),
                         'source_file': attrs.get('source_file', ''),
-                        'path': attrs.get('path', ''),
+                        'path': media_fields.get('path', ''),
+                        'clip_path': media_fields.get('clip_path', ''),
+                        'clip_url': media_fields.get('clip_url', ''),
+                        'relative_path': media_fields.get('relative_path', ''),
+                        'media_url': media_fields.get('media_url', ''),
                         'media_type': attrs.get('media_type', ''),
                         'caption': attrs.get('caption', ''),
                         'ocr_text': attrs.get('ocr_text', ''),
@@ -1042,7 +1475,20 @@ class KGBuilder:
                         'chapter_count': attrs.get('chapter_count', 0),
                         'chapter_titles': attrs.get('chapter_titles', []),
                         'isbn': attrs.get('isbn', ''),
+                        'teaching_cases': attrs.get('teaching_cases', []),
+                        'videos': attrs.get('videos', []),
+                        'teaching_case_count': attrs.get('teaching_case_count', 0),
+                        'video_count': attrs.get('video_count', 0),
+                        'media_count': attrs.get('media_count', 0),
+                        # 新增：图像作为属性而非节点
+                        'image_captions': attrs.get('image_captions', []),
+                        'image_ocr_texts': attrs.get('image_ocr_texts', []),
+                        'image_paths': attrs.get('image_paths', []),
+                        'image_count': attrs.get('image_count', 0),
+                        # 新增：视频剪辑列表
+                        'video_clips': attrs.get('video_clips', []),
                     }
+                    
                     session.run(f"""
                         MERGE (n:{label_clause} {{name: $name}})
                         SET n += $props
@@ -1051,15 +1497,18 @@ class KGBuilder:
                 # 创建关系
                 for source, target, data in self.graph.edges(data=True):
                     rel_type = self._normalize_relation_type(data.get('relation', 'CONNECTED'))
+                    media_path = self._normalize_media_path(data.get('media_path', ''))
+                    media_url = data.get('media_url', '') or self._media_url_from_path(media_path)
                     session.run(("""
                         MATCH (a:Entity {name: $source}), (b:Entity {name: $target})
                         MERGE (a)-[r:%s]->(b)
-                        SET r.type = $type, r.similarity = $similarity, r.caption = $caption, r.created_at = $created_at, r.media_path = $media_path, r.media_type = $media_type, r.ocr_text = $ocr_text
+                        SET r.type = $type, r.similarity = $similarity, r.caption = $caption, r.created_at = $created_at, r.media_path = $media_path, r.relative_path = $media_path, r.media_url = $media_url, r.media_type = $media_type, r.ocr_text = $ocr_text
                     """ % rel_type), source=source, target=target,
                         type=rel_type,
                         similarity=data.get('similarity', 0.0),
                         caption=data.get('caption', ''),
-                        media_path=data.get('media_path', ''),
+                        media_path=media_path,
+                        media_url=media_url,
                         media_type=data.get('media_type', ''),
                         ocr_text=data.get('ocr_text', ''),
                         created_at=datetime.now().isoformat())
@@ -1107,6 +1556,8 @@ class KGBuilder:
             'media_count': len(self.media_records),
             'density': nx.density(self.graph) if self.graph.number_of_nodes() > 0 else 0
         }
+        if self.invalid_media_records:
+            stats['invalid_media_records'] = self.invalid_media_records
         
         with open(os.path.join(output_dir, 'kg_stats.json'), 'w') as f:
             json.dump(stats, f, indent=2)
