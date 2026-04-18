@@ -13,6 +13,7 @@ import ast
 import json
 import importlib
 import atexit
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
@@ -27,11 +28,17 @@ try:
     Flask = _flask_module.Flask
     request = _flask_module.request
     jsonify = _flask_module.jsonify
-    render_template_string = _flask_module.render_template_string
+    render_template = _flask_module.render_template
     send_from_directory = _flask_module.send_from_directory
 except Exception:
     Flask = None
-    request = jsonify = render_template_string = send_from_directory = None
+    request = jsonify = render_template = send_from_directory = None
+
+try:
+    _werkzeug_utils = importlib.import_module("werkzeug.utils")
+    secure_filename = _werkzeug_utils.secure_filename
+except Exception:
+    secure_filename = None
 
 try:
     from xmodaler.kg.processors import VideoEditor
@@ -47,7 +54,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-if Flask is None or request is None or jsonify is None or render_template_string is None or send_from_directory is None:
+if Flask is None or request is None or jsonify is None or render_template is None or send_from_directory is None:
     raise ImportError("Flask is required to run app.py")
 
 app = Flask(__name__)
@@ -62,802 +69,28 @@ def _split_csv(value: Optional[str]) -> List[str]:
         return []
     return [item.strip() for item in str(value).split(',') if item.strip()]
 
-# HTML模板
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>跨模态知识图谱查询系统</title>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-            overflow: hidden;
-        }
-        
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-        
-        .header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }
-        
-        .header p {
-            font-size: 1.1em;
-            opacity: 0.9;
-        }
-        
-        .content {
-            display: grid;
-            grid-template-columns: 1fr 2fr;
-            gap: 20px;
-            padding: 30px;
-        }
-        
-        .sidebar {
-            border-right: 2px solid #eee;
-            padding-right: 20px;
-        }
-        
-        .section {
-            margin-bottom: 30px;
-        }
-        
-        .section h2 {
-            color: #333;
-            margin-bottom: 15px;
-            font-size: 1.3em;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-        }
-        
-        .search-box {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-        
-        input[type="text"] {
-            flex: 1;
-            padding: 12px;
-            border: 2px solid #ddd;
-            border-radius: 5px;
-            font-size: 1em;
-            transition: border-color 0.3s;
-        }
-        
-        input[type="text"]:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        
-        button {
-            padding: 12px 25px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 1em;
-            font-weight: bold;
-            transition: background 0.3s;
-        }
-        
-        button:hover {
-            background: #764ba2;
-        }
-        
-        .results {
-            background: #f8f9fa;
-            border-radius: 5px;
-            padding: 15px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        
-        .result-item {
-            background: white;
-            padding: 12px;
-            margin-bottom: 10px;
-            border-left: 4px solid #667eea;
-            border-radius: 3px;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .result-item:hover {
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            transform: translateX(5px);
-        }
-        
-        .result-item .entity-name {
-            font-weight: bold;
-            color: #333;
-            margin-bottom: 5px;
-        }
-        
-        .result-item .relation {
-            font-size: 0.9em;
-            color: #666;
-            margin-bottom: 5px;
-        }
-        
-        .result-item .media-info {
-            font-size: 0.85em;
-            color: #999;
-        }
-        
-        #graph-container {
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            background: #f8f9fa;
-            height: 600px;
-            position: relative;
-        }
-        
-        .legend {
-            margin-top: 15px;
-            font-size: 0.9em;
-        }
-        
-        .legend-item {
-            display: flex;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-        
-        .legend-color {
-            width: 15px;
-            height: 15px;
-            border-radius: 50%;
-            margin-right: 10px;
-        }
-        
-        .tooltip {
-            position: absolute;
-            background: rgba(0,0,0,0.8);
-            color: white;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 0.9em;
-            pointer-events: none;
-            z-index: 1000;
-        }
-        
-        .stats {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin-top: 20px;
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-        }
-        
-        .stat-item {
-            background: white;
-            padding: 12px;
-            border-radius: 5px;
-            text-align: center;
-        }
-        
-        .stat-value {
-            font-size: 1.5em;
-            font-weight: bold;
-            color: #667eea;
-        }
-        
-        .stat-label {
-            font-size: 0.9em;
-            color: #666;
-            margin-top: 5px;
-        }
-        
-        .video-container {
-            margin-top: 20px;
-            background: #f8f9fa;
-            border-radius: 5px;
-            padding: 15px;
-        }
-        
-        .video-item {
-            margin-bottom: 15px;
-            background: white;
-            padding: 10px;
-            border-radius: 5px;
-            border-left: 4px solid #5cb85c;
-        }
-        
-        .video-item video {
-            width: 100%;
-            max-height: 300px;
-            border-radius: 5px;
-        }
-        
-        .entity-section {
-            margin-bottom: 20px;
-        }
-        
-        .entity-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        
-        .entity-tag {
-            background: #e9ecef;
-            padding: 5px 10px;
-            border-radius: 15px;
-            font-size: 0.9em;
-            color: #495057;
-        }
 
-        .recommend-card {
-            background: #fff;
-            border-left: 4px solid #667eea;
-            border-radius: 4px;
-            padding: 10px;
-            margin-bottom: 10px;
-        }
+def _sanitize_upload_filename(filename: str) -> str:
+    cleaned = str(filename or '').strip()
+    if secure_filename:
+        cleaned = secure_filename(cleaned)
+    cleaned = cleaned or f"upload_{uuid4().hex}"
+    return cleaned
 
-        .recommend-title {
-            font-weight: bold;
-            color: #333;
-            margin-bottom: 4px;
-        }
 
-        .recommend-meta {
-            font-size: 0.86em;
-            color: #666;
-            margin-bottom: 4px;
-        }
+def _filename_keywords(path_value: str) -> List[str]:
+    stem = Path(path_value or '').stem
+    # 文件名语义补充：把空格/下划线/连字符拆开，辅助匹配“特殊命名”的教学素材。
+    chunks = re.split(r"[\s_\-]+", stem)
+    terms: List[str] = []
+    for chunk in chunks:
+        part = _safe_text(chunk)
+        if len(part) >= 2:
+            terms.append(part)
+    return list(dict.fromkeys(terms))
 
-        .recommend-risk {
-            font-size: 0.85em;
-            color: #b94a48;
-        }
+# 模板已迁移到 templates/index.html 与 templates/annotate.html
 
-        .recommend-suggest {
-            font-size: 0.85em;
-            color: #3c763d;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🌐 跨模态知识图谱查询系统</h1>
-            <p>连接计算机和思想实体的多模态知识网络</p>
-        </div>
-        
-        <div class="content">
-            <div class="sidebar">
-                <div class="section">
-                    <h2>🔍 查询</h2>
-                    <div class="search-box">
-                        <input type="text" id="searchInput" placeholder="输入实体名称...">
-                        <button onclick="searchEntity()">查询</button>
-                    </div>
-                </div>
-                
-                <div class="section">
-                    <h2>📊 结果</h2>
-                    <div class="results" id="results"></div>
-                </div>
-                
-                <div class="section">
-                    <h2>📈 统计</h2>
-                    <div id="stats"></div>
-                </div>
-            </div>
-            
-            <div class="main">
-                <div class="section">
-                    <h2>🗺️ 知识图谱可视化</h2>
-                    <div id="graph-container"></div>
-                    <div class="legend">
-                        <div class="legend-item">
-                            <div class="legend-color" style="background: #667eea;"></div>
-                            <span>文本实体 (连接媒体数)</span>
-                        </div>
-                        <div class="legend-item">
-                            <div class="legend-color" style="background: #f0ad4e;"></div>
-                            <span>图像 (图像标注)</span>
-                        </div>
-                        <div class="legend-item">
-                            <div class="legend-color" style="background: #5cb85c;"></div>
-                            <span>视频 (视频标注)</span>
-                        </div>
-                        <div class="legend-item">
-                            <div class="legend-color" style="background: #d9534f;"></div>
-                            <span>实体关系</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="section entity-section">
-                    <h2>📂 实体详情</h2>
-                    <div id="entityDetails"></div>
-                </div>
-                
-                <div class="section video-container">
-                    <h2>📹 视频播放</h2>
-                    <div id="videoPlayer"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        // 初始化知识图谱
-        function initializeGraph() {
-            fetch('/api/graph')
-                .then(response => response.json())
-                .then(data => {
-                    renderGraph(data);
-                    updateStats(data.stats);
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        // 渲染知识图谱
-        function renderGraph(data) {
-            const container = document.getElementById('graph-container');
-            container.innerHTML = ''; // 清空容器
-            
-            const width = container.offsetWidth;
-            const height = container.offsetHeight;
-            
-            const svg = d3.select('#graph-container')
-                .append('svg')
-                .attr('width', width)
-                .attr('height', height);
-            
-            const simulation = d3.forceSimulation(data.nodes)
-                .force('link', d3.forceLink(data.links).id(d => d.id).distance(100))
-                .force('charge', d3.forceManyBody().strength(-300))
-                .force('center', d3.forceCenter(width / 2, height / 2));
-            
-            const links = svg.selectAll('line')
-                .data(data.links)
-                .enter()
-                .append('line')
-                .attr('stroke', '#999')
-                .attr('stroke-opacity', 0.6)
-                .attr('stroke-width', d => Math.sqrt(d.strength) * 2);
-            
-            const nodes = svg.selectAll('circle')
-                .data(data.nodes)
-                .enter()
-                .append('circle')
-                .attr('r', d => 5 + d.connections * 2)
-                .attr('fill', d => {
-                    if (d.type === 'image') return '#f0ad4e';
-                    if (d.type === 'video') return '#5cb85c';
-                    return '#667eea';
-                })
-                .call(d3.drag()
-                    .on('start', dragstarted)
-                    .on('drag', dragged)
-                    .on('end', dragended));
-            
-            const labels = svg.selectAll('text')
-                .data(data.nodes)
-                .enter()
-                .append('text')
-                .attr('x', 0)
-                .attr('y', 0)
-                .attr('dy', '.35em')
-                .attr('text-anchor', 'middle')
-                .text(d => d.id.substring(0, 10))
-                .attr('font-size', '12px')
-                .attr('fill', '#333');
-            
-            simulation.on('tick', () => {
-                links
-                    .attr('x1', d => d.source.x)
-                    .attr('y1', d => d.source.y)
-                    .attr('x2', d => d.target.x)
-                    .attr('y2', d => d.target.y);
-                
-                nodes
-                    .attr('cx', d => d.x)
-                    .attr('cy', d => d.y);
-                
-                labels
-                    .attr('x', d => d.x)
-                    .attr('y', d => d.y);
-            });
-            
-            function dragstarted(event, d) {
-                if (!event.active) simulation.alphaTarget(0.3).restart();
-                d.fx = d.x;
-                d.fy = d.y;
-            }
-            
-            function dragged(event, d) {
-                d.fx = event.x;
-                d.fy = event.y;
-            }
-            
-            function dragended(event, d) {
-                if (!event.active) simulation.alphaTarget(0);
-                d.fx = null;
-                d.fy = null;
-            }
-        }
-        
-        // 搜索实体
-        function searchEntity() {
-            const entity = document.getElementById('searchInput').value;
-            if (!entity) return;
-            
-            fetch(`/api/query?entity=${encodeURIComponent(entity)}`)
-                .then(response => response.json())
-                .then(data => {
-                    displayResults(data);
-                    displayEntityDetails(entity);
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        // 显示搜索结果
-        function displayResults(results) {
-            const container = document.getElementById('results');
-            container.innerHTML = '';
-            
-            if (results.length === 0) {
-                container.innerHTML = '<div style="color: #999;">未找到相关实体</div>';
-                return;
-            }
-            
-            results.forEach(result => {
-                const item = document.createElement('div');
-                item.className = 'result-item';
-                item.innerHTML = `
-                    <div class="entity-name">${result.entity}</div>
-                    <div class="relation">关系: ${result.relation}</div>
-                    <div class="media-info">媒体: ${result.media || 'N/A'}</div>
-                `;
-                container.appendChild(item);
-            });
-        }
-        
-        // 显示实体详情
-        function displayEntityDetails(entity) {
-            const container = document.getElementById('entityDetails');
-            container.innerHTML = `<div style="color: #666;">加载中...</div>`;
-            
-            fetch(`/api/query_advanced?entity=${encodeURIComponent(entity)}`)
-                .then(response => response.json())
-                .then(data => {
-                    container.innerHTML = '';
-                    
-                    // 显示相似实体
-                    if (data.similar.length > 0) {
-                        const similarSection = document.createElement('div');
-                        similarSection.className = 'section';
-                        similarSection.innerHTML = '<h3>相似实体</h3>';
-                        
-                        data.similar.forEach(item => {
-                            const tag = document.createElement('div');
-                            tag.className = 'entity-tag';
-                            tag.innerText = item.entity;
-                            similarSection.appendChild(tag);
-                        });
-                        
-                        container.appendChild(similarSection);
-                    }
-                    
-                    // 显示相关实体
-                    if (data.related.length > 0) {
-                        const relatedSection = document.createElement('div');
-                        relatedSection.className = 'section';
-                        relatedSection.innerHTML = '<h3>相关实体</h3>';
-                        
-                        data.related.forEach(item => {
-                            const tag = document.createElement('div');
-                            tag.className = 'entity-tag';
-                            tag.innerText = item.entity;
-                            relatedSection.appendChild(tag);
-                        });
-                        
-                        container.appendChild(relatedSection);
-                    }
-
-                    // 显示教学推荐（Phase4.5: 可解释推理结果）
-                    if (data.recommendations && data.recommendations.length > 0) {
-                        const recSection = document.createElement('div');
-                        recSection.className = 'section';
-                        recSection.innerHTML = '<h3>教学推荐</h3>';
-
-                        data.recommendations.forEach(item => {
-                            const card = document.createElement('div');
-                            card.className = 'recommend-card';
-
-                            const viaHint = item.via_entity ? ` | 通过: ${item.via_entity}` : '';
-                            const hopHint = item.hop ? ` | 跳数: ${item.hop}` : '';
-                            const stageHint = (item.stage_tags || []).length ? ` | 学段: ${(item.stage_tags || []).join('/')}` : '';
-                            const courseHint = (item.course_tags || []).length ? ` | 课程: ${(item.course_tags || []).slice(0, 3).join('/')}` : '';
-
-                            card.innerHTML = `
-                                <div class="recommend-title">${item.entity || '未命名推荐'}（评分: ${item.score ?? 0}）</div>
-                                <div class="recommend-meta">关系: ${item.relation || 'UNKNOWN'}${viaHint}${hopHint}${stageHint}${courseHint}</div>
-                                <div class="recommend-meta">理由: ${item.reason || '无'}</div>
-                                <div class="recommend-risk">风险: ${item.risk_note || '风险可控'}</div>
-                                <div class="recommend-suggest">建议: ${item.suggested_use || '可直接用于课堂推荐'}</div>
-                            `;
-                            recSection.appendChild(card);
-                        });
-
-                        container.appendChild(recSection);
-                    }
-                    
-                    // 显示视频
-                    if (data.videos.length > 0) {
-                        const videoSection = document.getElementById('videoPlayer');
-                        videoSection.innerHTML = '';
-                        
-                        data.videos.forEach(video => {
-                            const videoItem = document.createElement('div');
-                            videoItem.className = 'video-item';
-                            const videoSrc = video.clip_path || video.clip_url || video.path || '';
-                            videoItem.innerHTML = `
-                                <h4>${video.name}</h4>
-                                <p>${video.caption}</p>
-                                <video controls>
-                                    <source src="${videoSrc}" type="video/mp4">
-                                    您的浏览器不支持视频标签。
-                                </video>
-                            `;
-                            videoSection.appendChild(videoItem);
-                        });
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    container.innerHTML = `<div style="color: red;">加载失败</div>`;
-                });
-        }
-        
-        // 更新统计信息
-        function updateStats(stats) {
-            const container = document.getElementById('stats');
-            container.innerHTML = `
-                <div class="stats">
-                    <div class="stats-grid">
-                        <div class="stat-item">
-                            <div class="stat-value">${stats.total_nodes}</div>
-                            <div class="stat-label">实体数量</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-value">${stats.total_edges}</div>
-                            <div class="stat-label">关系数量</div>
-                        </div>
-                    </div>
-                </div>
-            `;
-        }
-        
-        // 页面加载时初始化
-        document.addEventListener('DOMContentLoaded', initializeGraph);
-    </script>
-</body>
-</html>
-'''
-
-MANUAL_ANNOTATION_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>视频人工标注</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f5f7fb; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 8px; padding: 20px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .panel { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
-        h1, h2 { margin-top: 0; }
-        label { display: block; margin-top: 10px; font-weight: bold; }
-        input, select, textarea, button { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
-        textarea { min-height: 100px; }
-        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .status { margin-top: 12px; color: #1f6f43; }
-        .error { color: #b42318; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>视频人工标注（可选步骤）</h1>
-    <p>该页面仅用于人工补充标注，不会影响现有自动构建流程。</p>
-    <div class="grid">
-        <div class="panel">
-            <h2>视频播放</h2>
-            <label for="videoSelect">选择视频</label>
-            <select id="videoSelect"></select>
-            <video id="videoPlayer" controls style="width:100%; margin-top:12px; max-height:420px;"></video>
-            <div class="row">
-                <button type="button" onclick="markStart()">记录开始时间</button>
-                <button type="button" onclick="markEnd()">记录结束时间</button>
-            </div>
-        </div>
-        <div class="panel">
-            <h2>标注信息</h2>
-            <form id="annotationForm" onsubmit="saveAnnotation(event)">
-                <div class="row">
-                    <div>
-                        <label for="startSec">开始秒</label>
-                        <input id="startSec" type="number" step="0.1" min="0" value="0">
-                    </div>
-                    <div>
-                        <label for="endSec">结束秒</label>
-                        <input id="endSec" type="number" step="0.1" min="0" value="60">
-                    </div>
-                </div>
-                <label for="computerEntity">计算机知识点</label>
-                <select id="computerEntity" required></select>
-                <label for="ideologyEntity">思政元素</label>
-                <select id="ideologyEntity" required></select>
-                <label for="caption">人工描述</label>
-                <textarea id="caption" placeholder="例如：讲解栈和队列差异，强调逻辑推理。"></textarea>
-                <label for="ocrText">字幕/OCR文本</label>
-                <textarea id="ocrText" placeholder="可选，填写视频中关键文字。"></textarea>
-                <label for="confidence">置信度 (0~1)</label>
-                <input id="confidence" type="number" min="0" max="1" step="0.01" value="0.85">
-                <label for="annotator">标注人</label>
-                <input id="annotator" type="text" placeholder="可选">
-                <button type="submit" style="margin-top:12px;">保存标注</button>
-            </form>
-            <div id="status" class="status"></div>
-        </div>
-    </div>
-</div>
-
-<script>
-let videoItems = [];
-
-function showStatus(message, isError=false) {
-    const box = document.getElementById('status');
-    box.className = isError ? 'status error' : 'status';
-    box.textContent = message;
-}
-
-function secondsNow() {
-    const player = document.getElementById('videoPlayer');
-    return Number(player.currentTime || 0).toFixed(1);
-}
-
-function markStart() {
-    document.getElementById('startSec').value = secondsNow();
-}
-
-function markEnd() {
-    document.getElementById('endSec').value = secondsNow();
-}
-
-function updateVideoPlayer() {
-    const idx = Number(document.getElementById('videoSelect').value || 0);
-    const item = videoItems[idx];
-    const player = document.getElementById('videoPlayer');
-    if (!item) {
-        player.removeAttribute('src');
-        return;
-    }
-    player.src = item.url;
-    player.load();
-}
-
-async function loadVideos() {
-    const resp = await fetch('/api/annotation/videos');
-    const data = await resp.json();
-    videoItems = data.videos || [];
-    const select = document.getElementById('videoSelect');
-    select.innerHTML = '';
-    videoItems.forEach((item, idx) => {
-        const opt = document.createElement('option');
-        opt.value = idx;
-        opt.textContent = item.name;
-        select.appendChild(opt);
-    });
-    select.onchange = updateVideoPlayer;
-    updateVideoPlayer();
-}
-
-function fillSelect(id, values) {
-    const select = document.getElementById(id);
-    select.innerHTML = '';
-    (values || []).forEach((value) => {
-        const opt = document.createElement('option');
-        opt.value = value;
-        opt.textContent = value;
-        select.appendChild(opt);
-    });
-}
-
-async function loadEntities() {
-    const resp = await fetch('/api/annotation/entities');
-    const data = await resp.json();
-    fillSelect('computerEntity', data.computer_entities || []);
-    fillSelect('ideologyEntity', data.ideology_entities || []);
-}
-
-async function saveAnnotation(event) {
-    event.preventDefault();
-    const idx = Number(document.getElementById('videoSelect').value || 0);
-    const item = videoItems[idx];
-    if (!item) {
-        showStatus('请先选择视频。', true);
-        return;
-    }
-
-    const payload = {
-        video_name: item.name,
-        video_path: item.relative_path,
-        start_sec: Number(document.getElementById('startSec').value || 0),
-        end_sec: Number(document.getElementById('endSec').value || 0),
-        computer_entity: document.getElementById('computerEntity').value,
-        ideology_entity: document.getElementById('ideologyEntity').value,
-        caption: document.getElementById('caption').value,
-        ocr_text: document.getElementById('ocrText').value,
-        confidence: Number(document.getElementById('confidence').value || 0.85),
-        annotator: document.getElementById('annotator').value,
-    };
-
-    const resp = await fetch('/api/annotation/save', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-        showStatus(data.error || '保存失败', true);
-        return;
-    }
-    showStatus('保存成功: ' + (data.annotation_id || '')); 
-}
-
-async function init() {
-    try {
-        await loadEntities();
-        await loadVideos();
-    } catch (err) {
-        showStatus('初始化失败: ' + err, true);
-    }
-}
-
-document.addEventListener('DOMContentLoaded', init);
-</script>
-</body>
-</html>
-'''
 
 
 def _annotation_enabled() -> bool:
@@ -895,6 +128,29 @@ def _load_entity_choices() -> Dict[str, List[str]]:
         'computer_entities': computer_entities,
         'ideology_entities': ideology_entities,
     }
+
+
+def _normalize_multi_values(payload: Dict[str, Any], list_key: str, single_key: str) -> List[str]:
+    """兼容数组和单值字段，输出去重后的字符串列表。"""
+    values: List[str] = []
+    raw_list = payload.get(list_key)
+    if isinstance(raw_list, list):
+        values.extend(_safe_text(item) for item in raw_list)
+    elif raw_list not in (None, ''):
+        values.append(_safe_text(raw_list))
+
+    single_value = _safe_text(payload.get(single_key))
+    if single_value:
+        values.append(single_value)
+
+    normalized: List[str] = []
+    seen = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
 
 
 def _list_videos_for_annotation() -> List[Dict[str, str]]:
@@ -936,6 +192,38 @@ def _media_url_for_path(path_value: Optional[str]) -> str:
         return str(path_value)
 
 
+def _preferred_playback_url(item: Dict) -> str:
+    """统一播放URL策略：优先 clip_path，其次 clip_url，再回退 media_url/path。"""
+    clip_path = _safe_text(item.get('clip_path'))
+    clip_url = _safe_text(item.get('clip_url'))
+    media_url = _safe_text(item.get('media_url'))
+    path_value = _safe_text(item.get('path'))
+
+    if clip_path:
+        return _media_url_for_path(clip_path)
+    if clip_url:
+        return clip_url
+    if media_url:
+        return media_url
+    if path_value:
+        return _media_url_for_path(path_value)
+    return ''
+
+
+def _guess_media_type(labels: List[str], media_type: str, entity_name: str) -> str:
+    media = _safe_text(media_type).lower()
+    if media:
+        return media
+    label_set = {str(label) for label in (labels or [])}
+    if 'Video' in label_set:
+        return 'video'
+    if 'Image' in label_set:
+        return 'image'
+    if str(entity_name).lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        return 'video'
+    return 'text'
+
+
 class Neo4jQuery:
     """Neo4j数据库查询器"""
 
@@ -944,14 +232,17 @@ class Neo4jQuery:
                  password: str = "password",
                  database: str = "neo4j",
                  semantic_model_dir: Optional[str] = None,
-                 semantic_model_profile: str = "bert_cn_base"):
+                 semantic_model_profile: str = "bert_cn_base",
+                 semantic_device_mode: str = "cpu"):
         self.uri = uri
         self.database = database or "neo4j"
         self.semantic_model_dir = semantic_model_dir
         self.semantic_model_profile = str(semantic_model_profile or "bert_cn_base").strip().lower()
+        self.semantic_device_mode = str(semantic_device_mode or "cpu").strip().lower()
         self.semantic = SemanticScorer(
             model_dir=semantic_model_dir,
             model_name=self.semantic_model_profile,
+            device_mode=self.semantic_device_mode,
         ) if SemanticScorer else None
         self.semantic_model_resolved = str(getattr(self.semantic, 'model_dir', '') or '')
         self.semantic_model_available = bool(getattr(self.semantic, 'available', False))
@@ -987,6 +278,122 @@ class Neo4jQuery:
             ' '.join(record.get('teaching_objectives', []) or []),
         ]
         return _safe_text(' '.join(str(part) for part in parts if part))
+
+    @staticmethod
+    def _normalize_entity_query(text: Optional[str]) -> str:
+        return re.sub(r"\s+", "", _safe_text(text).lower())
+
+    def extract_query_terms(self, query: str) -> List[str]:
+        """把自然语言问题拆成检索词，并尝试匹配图中已有实体名。"""
+        cleaned = _safe_text(query)
+        compact = self._normalize_entity_query(cleaned)
+        if not compact:
+            return []
+
+        terms: List[str] = [cleaned]
+        seen = {cleaned}
+
+        normalized = re.sub(r"[？?！!。,.，；;:：()（）\[\]【】\"'“”]", " ", cleaned)
+        stop_words = [
+            "应该", "注意", "什么", "如何", "怎么", "请问", "有哪些", "需要", "可以", "关于", "一下", "一下子",
+            "的问题", "问题", "建议", "吗", "呢", "呀", "啊", "以及", "和", "与", "及", "的", "了", "在",
+        ]
+        for word in stop_words:
+            normalized = normalized.replace(word, " ")
+
+        chunks = [item.strip() for item in re.split(r"\s+", normalized) if item.strip()]
+        for chunk in chunks:
+            if len(chunk) < 2:
+                continue
+            if chunk not in seen:
+                terms.append(chunk)
+                seen.add(chunk)
+
+        # 规则抽取：学段与核心主题词（对“长句问法”做稳健拆分）
+        stage_hits = re.findall(r"大[一二三四]|高[一二三]|初[一二三]|小学|初中|高中|大学|高职", compact)
+        for token in stage_hits:
+            if token not in seen:
+                terms.append(token)
+                seen.add(token)
+
+        domain_lexicon = [
+            "规范化", "编程", "代码规范", "算法", "数据结构", "数据库", "操作系统", "计算机网络", "软件工程",
+            "面向对象", "实验", "思政", "马克思主义", "创新理论", "文化建设", "核心价值体系",
+        ]
+        for token in domain_lexicon:
+            if token in compact and token not in seen:
+                terms.append(token)
+                seen.add(token)
+
+        # 借助图库实体做子串命中：例如“大一规范化编程...”可命中“大一/规范化/编程”
+        if self.driver:
+            try:
+                with self.driver.session(database=self.database) as session:
+                    result = session.run(
+                        """
+                        MATCH (n:Entity)
+                        WITH n, coalesce(n.name, '') AS name,
+                             replace(coalesce(n.name, ''), ' ', '') AS compact_name
+                        WHERE size(compact_name) >= 2
+                          AND size(compact_name) <= 16
+                          AND toLower($query) CONTAINS toLower(compact_name)
+                        RETURN name
+                        ORDER BY size(name) ASC
+                        LIMIT 20
+                        """,
+                        query=compact,
+                    )
+                    for record in result:
+                        name = _safe_text(record.get('name'))
+                        if len(name) >= 2 and name not in seen:
+                            terms.append(name)
+                            seen.add(name)
+            except Exception as e:
+                logger.warning(f"查询词拆分阶段的实体提示失败: {e}")
+
+        return terms[:10]
+
+    def resolve_entity_name(self, entity: str) -> Tuple[str, List[str]]:
+        """Resolve user input to an existing node name (exact -> contains -> fallback)."""
+        if not self.driver:
+            cleaned = _safe_text(entity)
+            return cleaned, []
+
+        cleaned = _safe_text(entity)
+        compact = self._normalize_entity_query(cleaned)
+        if not compact:
+            return cleaned, []
+
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(
+                    """
+                    MATCH (n:Entity)
+                    WITH n, coalesce(n.name, '') AS name,
+                         toLower(replace(coalesce(n.name, ''), ' ', '')) AS compact_name,
+                         toLower($query) AS q
+                    WHERE compact_name = q
+                       OR compact_name CONTAINS q
+                       OR q CONTAINS compact_name
+                    RETURN name,
+                           CASE
+                               WHEN compact_name = q THEN 3
+                               WHEN compact_name CONTAINS q THEN 2
+                               ELSE 1
+                           END AS score
+                    ORDER BY score DESC, size(name) ASC
+                    LIMIT 8
+                    """,
+                    query=compact,
+                )
+                candidates = [record['name'] for record in result if record.get('name')]
+
+                if candidates:
+                    return candidates[0], candidates[1:]
+        except Exception as e:
+            logger.warning(f"实体解析失败，回退原始输入: {e}")
+
+        return cleaned, []
 
     def _stage_match_bonus(self, text: str, stage: Optional[str]) -> float:
         if not stage:
@@ -1147,8 +554,11 @@ class Neo4jQuery:
         try:
             with self.driver.session(database=self.database) as session:
                 result = session.run("""
-                    MATCH (a:Entity {name: $entity})-[r1]-(m:Entity)-[r2]-(b:Entity)
-                    WHERE b.name <> $entity AND m.name <> b.name
+                    MATCH (a {name: $entity})-[r1]-(m)-[r2]-(b)
+                    WHERE coalesce(b.name, '') <> ''
+                      AND coalesce(m.name, '') <> ''
+                      AND b.name <> $entity
+                      AND m.name <> b.name
                     RETURN b.name as entity,
                            type(r2) as relation,
                            coalesce(r2.similarity, 0.0) as similarity,
@@ -1156,6 +566,9 @@ class Neo4jQuery:
                            labels(b) as labels,
                            coalesce(b.summary, '') as summary,
                            coalesce(b.path, '') as path,
+                           coalesce(b.clip_path, '') as clip_path,
+                           coalesce(b.clip_url, '') as clip_url,
+                           coalesce(b.media_url, '') as media_url,
                            coalesce(b.media_type, '') as media_type,
                            coalesce(b.source_file, '') as source_file,
                            coalesce(b.stage_tags, []) as stage_tags,
@@ -1172,7 +585,15 @@ class Neo4jQuery:
                            2 as hop
                     LIMIT $limit
                 """, entity=entity, limit=max(20, limit))
-                return [dict(record) for record in result]
+                items = []
+                for record in result:
+                    item = dict(record)
+                    item['media'] = item.get('media_type', '')
+                    if not item.get('clip_url') and item.get('clip_path'):
+                        item['clip_url'] = _media_url_for_path(item.get('clip_path', ''))
+                    item['media_url'] = _preferred_playback_url(item)
+                    items.append(item)
+                return items
         except Exception as e:
             logger.warning(f"二跳候选查询失败: {e}")
             return []
@@ -1182,32 +603,172 @@ class Neo4jQuery:
             return []
 
         try:
+            query_terms = self.extract_query_terms(entity)
+            all_items: List[Dict] = []
+            visited_entities = set()
             with self.driver.session(database=self.database) as session:
-                result = session.run("""
-                    MATCH (a:Entity {name: $entity})-[r]-(b:Entity)
-                    RETURN b.name as entity,
-                           type(r) as relation,
-                           coalesce(r.caption, '') as caption,
-                           coalesce(r.similarity, 0.0) as similarity,
-                           labels(b) as labels,
-                           coalesce(b.summary, '') as summary,
-                           coalesce(b.path, '') as path,
-                           coalesce(b.media_type, '') as media_type,
-                           coalesce(b.source_file, '') as source_file,
-                           coalesce(b.stage_tags, []) as stage_tags,
-                           coalesce(b.course_tags, []) as course_tags,
-                           coalesce(b.ideology_tags, []) as ideology_tags,
-                           coalesce(b.teaching_objectives, []) as teaching_objectives,
-                           coalesce(b.chapter_count, 0) as chapter_count,
-                           coalesce(b.isbn, '') as isbn
-                    ORDER BY similarity DESC
-                    LIMIT 30
-                """, entity=entity)
+                for query_term in query_terms:
+                    resolved_entity, _ = self.resolve_entity_name(query_term)
+                    if not resolved_entity or resolved_entity in visited_entities:
+                        continue
+                    visited_entities.add(resolved_entity)
+                    result = session.run("""
+                        MATCH (a {name: $entity})-[r]-(b)
+                        WHERE coalesce(b.name, '') <> ''
+                        RETURN b.name as entity,
+                               type(r) as relation,
+                               coalesce(r.caption, '') as caption,
+                               coalesce(r.similarity, 0.0) as similarity,
+                               labels(b) as labels,
+                               coalesce(b.summary, '') as summary,
+                               coalesce(b.path, '') as path,
+                               coalesce(b.clip_path, '') as clip_path,
+                               coalesce(b.clip_url, '') as clip_url,
+                               coalesce(b.media_url, '') as media_url,
+                               coalesce(b.media_type, '') as media_type,
+                               coalesce(b.source_file, '') as source_file,
+                               coalesce(b.stage_tags, []) as stage_tags,
+                               coalesce(b.course_tags, []) as course_tags,
+                               coalesce(b.ideology_tags, []) as ideology_tags,
+                               coalesce(b.teaching_objectives, []) as teaching_objectives,
+                               coalesce(b.chapter_count, 0) as chapter_count,
+                               coalesce(b.isbn, '') as isbn
+                        ORDER BY similarity DESC
+                        LIMIT 30
+                    """, entity=resolved_entity)
 
-                return [dict(record) for record in result]
+                    for record in result:
+                        item = dict(record)
+                        item['media'] = _guess_media_type(item.get('labels') or [], item.get('media_type', ''), item.get('entity', ''))
+                        if not item.get('clip_url') and item.get('clip_path'):
+                            item['clip_url'] = _media_url_for_path(item.get('clip_path', ''))
+                        item['media_url'] = _preferred_playback_url(item)
+                        item['query_term'] = query_term
+                        item['resolved_entity'] = resolved_entity
+                        all_items.append(item)
+
+            dedup: Dict[str, Dict] = {}
+            for item in all_items:
+                key = f"{item.get('entity','')}|{item.get('relation','')}|{item.get('media_url','')}"
+                prev = dedup.get(key)
+                if prev is None or float(item.get('similarity', 0.0)) > float(prev.get('similarity', 0.0)):
+                    dedup[key] = item
+
+            merged = list(dedup.values())
+            merged.sort(key=lambda x: float(x.get('similarity', 0.0)), reverse=True)
+            return merged[:50]
         except Exception as e:
             logger.error(f"查询失败: {str(e)}")
             return []
+
+    def get_subgraph_data(self, entity: str, hops: int = 2, node_limit: int = 180, edge_limit: int = 400) -> Dict:
+        if not self.driver:
+            return {"nodes": [], "links": [], "stats": {"total_nodes": 0, "total_edges": 0}, "charts": {"relation_distribution": {}, "media_distribution": {}}}
+
+        hops = 2 if int(hops) >= 2 else 1
+        try:
+            resolved_entity, _ = self.resolve_entity_name(entity)
+            with self.driver.session(database=self.database) as session:
+                node_result = session.run(
+                    """
+                    MATCH (c:Entity {name: $entity})
+                    OPTIONAL MATCH p=(c)-[*1..2]-(n:Entity)
+                    WITH collect(DISTINCT c) + collect(DISTINCT n) AS raw_nodes
+                    UNWIND raw_nodes AS node
+                    WITH DISTINCT node LIMIT $node_limit
+                    RETURN node.name AS name,
+                           labels(node) AS labels,
+                           coalesce(node.media_type, '') AS media_type,
+                           coalesce(node.summary, '') AS summary,
+                           coalesce(node.path, '') AS path,
+                           coalesce(node.caption, '') AS caption,
+                           COUNT { (node)--() } AS connections
+                    """,
+                    entity=resolved_entity,
+                    node_limit=max(20, int(node_limit)),
+                )
+
+                nodes = []
+                node_names = []
+                media_distribution: Dict[str, int] = {}
+                for record in node_result:
+                    name = record.get('name')
+                    if not name:
+                        continue
+                    labels = record.get('labels') or []
+                    media = _guess_media_type(labels, record.get('media_type', ''), name)
+                    node_type = 'entity'
+                    if 'TeachingCase' in labels:
+                        node_type = 'case'
+                    elif media == 'video':
+                        node_type = 'video'
+                    elif media == 'image':
+                        node_type = 'image'
+                    elif 'IdeologyElement' in labels:
+                        node_type = 'ideology'
+                    elif 'KnowledgePoint' in labels:
+                        node_type = 'knowledge'
+                    nodes.append({
+                        'id': name,
+                        'connections': record.get('connections', 0),
+                        'type': node_type,
+                        'labels': labels,
+                        'media_type': media,
+                        'summary': record.get('summary', ''),
+                        'path': record.get('path', ''),
+                        'caption': record.get('caption', ''),
+                    })
+                    node_names.append(name)
+                    media_distribution[media] = media_distribution.get(media, 0) + 1
+
+                if not node_names:
+                    return {"nodes": [], "links": [], "stats": {"total_nodes": 0, "total_edges": 0}, "charts": {"relation_distribution": {}, "media_distribution": {}}}
+
+                edge_result = session.run(
+                    """
+                    MATCH (a:Entity)-[r]->(b:Entity)
+                    WHERE a.name IN $names AND b.name IN $names
+                    RETURN a.name AS source,
+                           b.name AS target,
+                           type(r) AS type,
+                           coalesce(r.similarity, 0.0) AS similarity,
+                           coalesce(r.caption, '') AS caption
+                    LIMIT $edge_limit
+                    """,
+                    names=node_names,
+                    edge_limit=max(50, int(edge_limit)),
+                )
+
+                relation_distribution: Dict[str, int] = {}
+                links = []
+                for record in edge_result:
+                    rel_type = record.get('type', 'CONNECTED')
+                    relation_distribution[rel_type] = relation_distribution.get(rel_type, 0) + 1
+                    links.append({
+                        'source': record.get('source'),
+                        'target': record.get('target'),
+                        'type': rel_type,
+                        'strength': max(float(record.get('similarity') or 0.0), 0.3),
+                        'caption': record.get('caption', ''),
+                    })
+
+                return {
+                    'nodes': nodes,
+                    'links': links,
+                    'stats': {
+                        'total_nodes': len(nodes),
+                        'total_edges': len(links),
+                        'center': resolved_entity,
+                        'hops': hops,
+                    },
+                    'charts': {
+                        'relation_distribution': relation_distribution,
+                        'media_distribution': media_distribution,
+                    },
+                }
+        except Exception as e:
+            logger.error(f"获取子图失败: {str(e)}")
+            return {"nodes": [], "links": [], "stats": {"total_nodes": 0, "total_edges": 0}, "charts": {"relation_distribution": {}, "media_distribution": {}}}
 
     def get_graph_data(self) -> Dict:
         if not self.driver:
@@ -1262,16 +823,15 @@ class Neo4jQuery:
                     LIMIT 500
                 """)
 
-                links = [
-                    {
+                links = []
+                for record in edges_result:
+                    links.append({
                         'source': record['source'],
                         'target': record['target'],
                         'type': record['type'],
                         'strength': max(float(record['similarity'] or 0.0), 0.3),
                         'caption': record['caption'],
-                    }
-                    for record in edges_result
-                ]
+                    })
 
                 total_nodes = session.run("MATCH (n:Entity) RETURN COUNT(n) as total_nodes").single()["total_nodes"]
                 total_edges = session.run("MATCH ()-[r]->() RETURN COUNT(r) as total_edges").single()["total_edges"]
@@ -1302,9 +862,11 @@ class Neo4jQuery:
             return {"similar": [], "related": [], "videos": [], "recommendations": []}
 
         try:
+            resolved_entity, entity_candidates = self.resolve_entity_name(entity)
             with self.driver.session(database=self.database) as session:
                 result = session.run("""
-                    MATCH (a:Entity {name: $entity})-[r]-(b:Entity)
+                    MATCH (a {name: $entity})-[r]-(b)
+                    WHERE coalesce(b.name, '') <> ''
                     RETURN b.name as entity,
                            type(r) as relation,
                            coalesce(r.similarity, 0.0) as similarity,
@@ -1312,6 +874,9 @@ class Neo4jQuery:
                            labels(b) as labels,
                            coalesce(b.summary, '') as summary,
                            coalesce(b.path, '') as path,
+                           coalesce(b.clip_path, '') as clip_path,
+                           coalesce(b.clip_url, '') as clip_url,
+                           coalesce(b.media_url, '') as media_url,
                            coalesce(b.media_type, '') as media_type,
                            coalesce(b.source_file, '') as source_file,
                            coalesce(b.stage_tags, []) as stage_tags,
@@ -1325,12 +890,11 @@ class Neo4jQuery:
                            coalesce(b.width, 0) as width,
                            coalesce(b.height, 0) as height
                     LIMIT 100
-                """, entity=entity)
+                """, entity=resolved_entity)
 
                 items = [dict(record) for record in result]
-                items.extend(self._query_two_hop_candidates(entity, limit=max(50, top_k * 12)))
+                items.extend(self._query_two_hop_candidates(resolved_entity, limit=max(50, top_k * 12)))
 
-                # 按实体去重，保留同实体中分数更高的候选
                 dedup_items: Dict[str, Dict] = {}
                 for item in items:
                     key = item.get('entity')
@@ -1364,6 +928,10 @@ class Neo4jQuery:
                     item['risk_note'] = risk_note
                     item['suggested_use'] = suggested_use
                     item['entity_type'] = 'case' if 'TeachingCase' in (item.get('labels') or []) else item.get('media_type') or 'entity'
+                    item['media'] = _guess_media_type(item.get('labels') or [], item.get('media_type', ''), item.get('entity', ''))
+                    if not item.get('clip_url') and item.get('clip_path'):
+                        item['clip_url'] = _media_url_for_path(item.get('clip_path', ''))
+                    item['media_url'] = _preferred_playback_url(item)
 
                     relation = item.get('relation', '')
                     labels = item.get('labels') or []
@@ -1396,10 +964,22 @@ class Neo4jQuery:
                             'hop': item.get('hop', 1),
                         })
 
-                    if 'Video' in labels or item.get('media_type') == 'video':
+                    media_type = str(item.get('media_type') or '').lower()
+                    entity_name = str(item.get('entity') or '')
+                    relation_hint = str(item.get('relation') or '')
+                    looks_like_video_file = entity_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+                    if 'Video' in labels or media_type == 'video' or relation_hint == 'MEDIA_LINKED_VIDEO' or looks_like_video_file:
                         video_path = item.get('path')
-                        clip_path = video_path
-                        if video_path and os.path.exists(video_path) and self.video_editor:
+                        clip_path = item.get('clip_path') or item.get('clip_url') or ''
+                        clip_url = item.get('clip_url') or _media_url_for_path(clip_path)
+                        video_url = _preferred_playback_url(item)
+
+                        abs_video_path = video_path
+                        if abs_video_path and not os.path.isabs(abs_video_path):
+                            abs_video_path = os.path.join(data_dir, abs_video_path)
+
+                        # 仅在没有现成 clip 且视频存在时，动态切60秒片段
+                        if (not clip_path) and abs_video_path and os.path.exists(abs_video_path) and self.video_editor:
                             estimated_seconds = 0.0
                             fps = float(item.get('fps') or 0.0)
                             frame_count = int(item.get('frame_count') or 0)
@@ -1410,11 +990,15 @@ class Neo4jQuery:
                                 clip_dir = os.path.join(data_dir, 'clips')
                                 os.makedirs(clip_dir, exist_ok=True)
                                 clip_path = os.path.join(clip_dir, f"{Path(item['entity']).stem}_clip.mp4")
-                                if not self.video_editor.clip_video(video_path, clip_path, start_time, 60):
-                                    clip_path = video_path
+                                if not self.video_editor.clip_video(abs_video_path, clip_path, start_time, 60):
+                                    clip_path = ''
+                                else:
+                                    clip_url = _media_url_for_path(clip_path)
 
-                        clip_url = _media_url_for_path(clip_path)
-                        video_url = _media_url_for_path(video_path)
+                        if not clip_url and clip_path:
+                            clip_url = _media_url_for_path(clip_path)
+                        if not video_url:
+                            video_url = _media_url_for_path(video_path)
 
                         videos.append({
                             'name': item['entity'],
@@ -1422,6 +1006,8 @@ class Neo4jQuery:
                             'clip_path': clip_url,
                             'clip_file': clip_path,
                             'path': video_url,
+                            'media': 'video',
+                            'media_url': clip_url or video_url,
                             'source_file': video_path,
                             'score': score,
                             'reason': reason,
@@ -1460,6 +1046,8 @@ class Neo4jQuery:
                     'related': related_entities[:top_k],
                     'videos': videos[:top_k],
                     'recommendations': recommendations[:top_k],
+                    'resolved_entity': resolved_entity,
+                    'entity_candidates': entity_candidates,
                     'semantic_model': {
                         'profile': self.semantic_model_profile,
                         'resolved_path': self.semantic_model_resolved,
@@ -1473,6 +1061,8 @@ class Neo4jQuery:
                 "related": [],
                 "videos": [],
                 "recommendations": [],
+                "resolved_entity": entity,
+                "entity_candidates": [],
                 "semantic_model": {
                     'profile': self.semantic_model_profile,
                     'resolved_path': self.semantic_model_resolved,
@@ -1487,6 +1077,7 @@ class Neo4jQuery:
 
 # 全局查询器
 neo4j_query = None
+caption_generator = None
 
 
 def get_neo4j_query():
@@ -1499,6 +1090,7 @@ def get_neo4j_query():
             database=app.config.get('NEO4J_DATABASE', 'neo4j'),
             semantic_model_dir=app.config.get('QUERY_BERT_MODEL_DIR'),
             semantic_model_profile=app.config.get('QUERY_BERT_PROFILE', 'bert_cn_base'),
+            semantic_device_mode=app.config.get('QUERY_DEVICE_MODE', 'cpu'),
         )
     return neo4j_query
 
@@ -1511,19 +1103,38 @@ def close_neo4j_query():
         neo4j_query = None
 
 
+def get_caption_generator():
+    global caption_generator
+    if caption_generator is None:
+        try:
+            from xmodaler.kg.processors import CaptionGenerator
+            caption_generator = CaptionGenerator(
+                use_ocr=True,
+                ocr_lang='chi_sim+eng',
+                use_asr=True,
+                use_xmodaler_video=True,
+                xmodaler_model_type='tdconved',
+                device_mode=app.config.get('QUERY_DEVICE_MODE', 'cpu'),
+            )
+        except Exception as e:
+            logger.error(f"初始化媒体处理器失败: {e}")
+            caption_generator = None
+    return caption_generator
+
+
 atexit.register(close_neo4j_query)
 
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template('index.html')
 
 
 @app.route('/annotate')
 def annotate_page():
     if not _annotation_enabled():
         return jsonify({"error": "Manual annotation is disabled"}), 403
-    return render_template_string(MANUAL_ANNOTATION_TEMPLATE)
+    return render_template('annotate.html')
 
 
 @app.route('/api/annotation/entities', methods=['GET'])
@@ -1552,15 +1163,21 @@ def annotation_save():
 
     video_name = _safe_text(payload.get('video_name'))
     video_path = _safe_text(payload.get('video_path'))
-    computer_entity = _safe_text(payload.get('computer_entity'))
-    ideology_entity = _safe_text(payload.get('ideology_entity'))
+    computer_entities = _normalize_multi_values(payload, 'computer_entities', 'computer_entity')
+    ideology_entities = _normalize_multi_values(payload, 'ideology_entities', 'ideology_entity')
 
     if not video_name or not video_path:
         return jsonify({'error': 'video_name 和 video_path 不能为空'}), 400
-    if computer_entity not in computer_set:
-        return jsonify({'error': 'computer_entity 不在预定义列表中'}), 400
-    if ideology_entity not in ideology_set:
-        return jsonify({'error': 'ideology_entity 不在预定义列表中'}), 400
+    if not computer_entities and not ideology_entities:
+        return jsonify({'error': '至少选择一个计算机知识点或思政元素'}), 400
+
+    invalid_computers = [item for item in computer_entities if item not in computer_set]
+    if invalid_computers:
+        return jsonify({'error': f'computer_entities 存在非法值: {invalid_computers}'}), 400
+
+    invalid_ideologies = [item for item in ideology_entities if item not in ideology_set]
+    if invalid_ideologies:
+        return jsonify({'error': f'ideology_entities 存在非法值: {invalid_ideologies}'}), 400
 
     try:
         start_sec = max(0.0, float(payload.get('start_sec', 0.0)))
@@ -1569,7 +1186,9 @@ def annotation_save():
     except (TypeError, ValueError):
         return jsonify({'error': '数值字段格式错误'}), 400
 
-    annotation_id = f"{video_name}__{start_sec:.1f}_{end_sec:.1f}__{computer_entity}__{ideology_entity}"
+    primary_computer = computer_entities[0] if computer_entities else 'NONE'
+    primary_ideology = ideology_entities[0] if ideology_entities else 'NONE'
+    annotation_id = f"{video_name}__{start_sec:.1f}_{end_sec:.1f}__{primary_computer}__{primary_ideology}"
     record = {
         'annotation_id': annotation_id,
         'video_name': video_name,
@@ -1577,8 +1196,11 @@ def annotation_save():
         'video_url': f"/media/{video_path}",
         'start_sec': round(start_sec, 1),
         'end_sec': round(end_sec, 1),
-        'computer_entity': computer_entity,
-        'ideology_entity': ideology_entity,
+        'computer_entities': computer_entities,
+        'ideology_entities': ideology_entities,
+        # 兼容旧字段
+        'computer_entity': computer_entities[0] if computer_entities else '',
+        'ideology_entity': ideology_entities[0] if ideology_entities else '',
         'caption': _safe_text(payload.get('caption')),
         'ocr_text': _safe_text(payload.get('ocr_text')),
         'confidence': max(0.0, min(1.0, confidence)),
@@ -1654,6 +1276,195 @@ def get_graph():
     return jsonify(graph_data)
 
 
+@app.route('/api/graph/subgraph', methods=['GET'])
+def get_subgraph():
+    entity = request.args.get('entity', '')
+    hops = request.args.get('hops', '2')
+    if not entity:
+        return jsonify({"error": "Entity parameter required"}), 400
+    try:
+        hops_int = max(1, min(2, int(hops)))
+    except Exception:
+        hops_int = 2
+
+    query_engine = get_neo4j_query()
+    graph_data = query_engine.get_subgraph_data(entity=entity, hops=hops_int)
+    return jsonify(graph_data)
+
+
+def _load_ingest_whitelist() -> Dict[str, List[str]]:
+    choices = _load_entity_choices()
+    computer = choices.get('computer_entities', [])
+    ideology = choices.get('ideology_entities', [])
+    return {
+        'computer_entities': [item for item in computer if item],
+        'ideology_entities': [item for item in ideology if item],
+    }
+
+
+def _match_terms(text: str, candidates: List[str]) -> List[str]:
+    matched = []
+    normalized = _safe_text(text)
+    for term in candidates or []:
+        if term and term in normalized:
+            matched.append(term)
+    return list(dict.fromkeys(matched))
+
+
+@app.route('/api/upload_media', methods=['POST'])
+def upload_media():
+    file = request.files.get('file')
+    if file is None or not file.filename:
+        return jsonify({'error': '缺少上传文件'}), 400
+
+    suffix = Path(file.filename).suffix.lower()
+    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    video_exts = {'.mp4', '.avi', '.mov', '.mkv'}
+    if suffix in image_exts:
+        subdir = 'uploads/img'
+        media_type = 'image'
+    elif suffix in video_exts:
+        subdir = 'uploads/video'
+        media_type = 'video'
+    else:
+        return jsonify({'error': f'不支持的文件类型: {suffix}'}), 400
+
+    filename = _sanitize_upload_filename(file.filename)
+    data_root = _data_root()
+    abs_dir = data_root / subdir
+    abs_dir.mkdir(parents=True, exist_ok=True)
+    target_path = abs_dir / filename
+    file.save(str(target_path))
+
+    relative_path = target_path.relative_to(data_root).as_posix()
+    return jsonify({
+        'ok': True,
+        'relative_path': relative_path,
+        'media_type': media_type,
+        'media_url': f"/media/{relative_path}",
+    })
+
+
+@app.route('/api/ingest_media', methods=['POST'])
+def ingest_media():
+    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    relative_path = _safe_text(payload.get('relative_path'))
+    if not relative_path:
+        return jsonify({'error': 'relative_path 不能为空'}), 400
+
+    data_root = _data_root().resolve()
+    abs_path = (data_root / relative_path).resolve()
+    try:
+        abs_path.relative_to(data_root)
+    except Exception:
+        return jsonify({'error': '非法路径'}), 400
+    if not abs_path.exists() or not abs_path.is_file():
+        return jsonify({'error': '文件不存在'}), 404
+
+    suffix = abs_path.suffix.lower()
+    is_video = suffix in {'.mp4', '.avi', '.mov', '.mkv'}
+    is_image = suffix in {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    if not is_video and not is_image:
+        return jsonify({'error': '暂不支持的媒体类型'}), 400
+
+    generator = get_caption_generator()
+    if generator is None:
+        return jsonify({'error': '媒体处理器不可用'}), 500
+
+    caption = generator.generate_video_caption(str(abs_path)) if is_video else generator.generate_image_caption(str(abs_path))
+    ocr_text = None if is_video else generator.recognize_text_from_image(str(abs_path))
+    whitelist = _load_ingest_whitelist()
+    filename_terms = _filename_keywords(relative_path)
+    hint_text = ' '.join([caption or '', ocr_text or '', ' '.join(filename_terms)])
+    computer_hits = _match_terms(hint_text, whitelist.get('computer_entities', []))
+    ideology_hits = _match_terms(hint_text, whitelist.get('ideology_entities', []))
+    linked_entities = list(dict.fromkeys(computer_hits + ideology_hits))
+
+    query_engine = get_neo4j_query()
+    if not query_engine.driver:
+        return jsonify({'error': 'Neo4j 不可用'}), 500
+
+    media_url = f"/media/{relative_path}"
+    media_name = abs_path.name
+    with query_engine.driver.session(database=query_engine.database) as session:
+        if is_video:
+            session.run(
+                """
+                MERGE (v:Entity:Media:Video {name: $name})
+                SET v.media_type = 'video',
+                    v.path = $path,
+                    v.relative_path = $relative_path,
+                    v.media_url = $media_url,
+                    v.caption = $caption,
+                    v.updated_at = $updated_at
+                """,
+                name=media_name,
+                path=relative_path,
+                relative_path=relative_path,
+                media_url=media_url,
+                caption=caption or '',
+                updated_at=datetime.utcnow().isoformat() + 'Z',
+            )
+            for entity in linked_entities:
+                session.run(
+                    """
+                    MATCH (e:Entity {name: $entity})
+                    MATCH (v:Entity {name: $video_name})
+                    MERGE (e)-[r:MEDIA_LINKED_VIDEO]->(v)
+                    SET r.similarity = coalesce(r.similarity, 0.8),
+                        r.caption = $caption,
+                        r.media_path = $relative_path,
+                        r.media_url = $media_url,
+                        r.media_type = 'video',
+                        r.updated_at = $updated_at
+                    """,
+                    entity=entity,
+                    video_name=media_name,
+                    caption=caption or '',
+                    relative_path=relative_path,
+                    media_url=media_url,
+                    updated_at=datetime.utcnow().isoformat() + 'Z',
+                )
+        else:
+            for entity in linked_entities:
+                session.run(
+                    """
+                    MATCH (e:Entity {name: $entity})
+                    SET e.image_captions = CASE
+                        WHEN $caption = '' THEN coalesce(e.image_captions, [])
+                        WHEN $caption IN coalesce(e.image_captions, []) THEN coalesce(e.image_captions, [])
+                        ELSE coalesce(e.image_captions, []) + $caption
+                    END,
+                    e.image_ocr_texts = CASE
+                        WHEN $ocr_text = '' THEN coalesce(e.image_ocr_texts, [])
+                        WHEN $ocr_text IN coalesce(e.image_ocr_texts, []) THEN coalesce(e.image_ocr_texts, [])
+                        ELSE coalesce(e.image_ocr_texts, []) + $ocr_text
+                    END,
+                    e.image_paths = CASE
+                        WHEN $relative_path IN coalesce(e.image_paths, []) THEN coalesce(e.image_paths, [])
+                        ELSE coalesce(e.image_paths, []) + $relative_path
+                    END,
+                    e.image_count = size(coalesce(e.image_paths, [])),
+                    e.updated_at = $updated_at
+                    """,
+                    entity=entity,
+                    caption=caption or '',
+                    ocr_text=ocr_text or '',
+                    relative_path=relative_path,
+                    updated_at=datetime.utcnow().isoformat() + 'Z',
+                )
+
+    return jsonify({
+        'ok': True,
+        'summary': f"{media_name} 已处理，匹配实体 {len(linked_entities)} 个",
+        'media_type': 'video' if is_video else 'image',
+        'caption': caption,
+        'ocr_text': ocr_text,
+        'linked_entities': linked_entities,
+        'filename_terms': filename_terms,
+    })
+
+
 @app.route('/video/<path:filename>')
 def serve_video(filename):
     video_dir = os.path.join(app.root_path, 'data', 'clips')
@@ -1690,12 +1501,15 @@ if __name__ == '__main__':
     app.config['NEO4J_PASSWORD'] = os.getenv('NEO4J_PASSWORD', 'password')
     app.config['NEO4J_DATABASE'] = os.getenv('NEO4J_DATABASE', 'neo4j')
     app.config['QUERY_BERT_MODEL_DIR'] = os.getenv('QUERY_BERT_MODEL_DIR', '')
+    app.config['QUERY_BERT_PROFILE'] = os.getenv('QUERY_BERT_PROFILE', 'bert_cn_base')
+    app.config['QUERY_DEVICE_MODE'] = os.getenv('QUERY_DEVICE_MODE', 'cpu')
     app.config['ENABLE_MANUAL_ANNOTATION'] = os.getenv('ENABLE_MANUAL_ANNOTATION', 'false').lower() in {'1', 'true', 'yes', 'on'}
 
     logger.info("启动Flask服务器...")
     logger.info("访问: http://localhost:5000")
     logger.info(f"人工标注页面: {'已启用' if app.config['ENABLE_MANUAL_ANNOTATION'] else '未启用'}")
     logger.info(f"查询语义模型档位: {app.config.get('QUERY_BERT_PROFILE', 'bert_cn_base')}")
+    logger.info(f"查询语义设备: {app.config.get('QUERY_DEVICE_MODE', 'cpu')}")
     if app.config['QUERY_BERT_MODEL_DIR']:
         logger.info(f"查询语义模型: {app.config['QUERY_BERT_MODEL_DIR']}")
 
