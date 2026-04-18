@@ -54,9 +54,10 @@ def _flatten_text(value: Any) -> str:
 class SemanticScorer:
     """基于本地中文BERT或词面规则的语义打分器。"""
 
-    def __init__(self, model_dir: Optional[str] = None, max_length: int = 64, model_name: str = "bert_cn_base"):
+    def __init__(self, model_dir: Optional[str] = None, max_length: int = 64, model_name: str = "bert_cn_base", device_mode: str = "auto"):
         self.max_length = max_length
         self.model_name = str(model_name or "bert_cn_base").strip().lower()
+        self.device_mode = str(device_mode or "auto").strip().lower()
         self.model_dir = self._resolve_model_dir(model_dir)
         self.tokenizer = None
         self.model = None
@@ -113,16 +114,22 @@ class SemanticScorer:
         try:
             if torch is None:
                 return
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if self.device_mode == "cpu":
+                self.device = torch.device("cpu")
+            elif self.device_mode == "cuda":
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.tokenizer = _transformers.AutoTokenizer.from_pretrained(str(self.model_dir), local_files_only=True)
             self.model = _transformers.AutoModel.from_pretrained(str(self.model_dir), local_files_only=True).to(self.device)
             self.model.eval()
             self.available = True
-        except Exception:
+        except Exception as e:
             self.tokenizer = None
             self.model = None
             self.device = None
             self.available = False
+            print(f"[SemanticScorer] 本地BERT加载失败: {e}")
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -239,9 +246,10 @@ class SemanticScorer:
 class RelationReranker:
     """计算机知识点-思政元素关系重排器（本地BERT优先，缺失时降级）。"""
 
-    def __init__(self, model_dir: Optional[str] = None, threshold: float = 0.55):
+    def __init__(self, model_dir: Optional[str] = None, threshold: float = 0.55, device_mode: str = "auto"):
         self.model_dir = self._resolve_model_dir(model_dir)
         self.threshold = max(0.0, min(1.0, float(threshold)))
+        self.device_mode = str(device_mode or "auto").strip().lower()
         self.available = False
         self.tokenizer = None
         self.model = None
@@ -272,7 +280,12 @@ class RelationReranker:
             return
 
         try:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if self.device_mode == "cpu":
+                self.device = torch.device("cpu")
+            elif self.device_mode == "cuda":
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.tokenizer = _transformers.AutoTokenizer.from_pretrained(str(self.model_dir), local_files_only=True)
             self.model = _transformers.AutoModelForSequenceClassification.from_pretrained(
                 str(self.model_dir),
@@ -297,13 +310,14 @@ class RelationReranker:
                 self.positive_label_ids = [max(self.id2label.keys())]
 
             self.available = self.tokenizer is not None and self.model is not None and bool(self.positive_label_ids)
-        except Exception:
+        except Exception as e:
             self.available = False
             self.tokenizer = None
             self.model = None
             self.device = None
             self.id2label = {}
             self.positive_label_ids = []
+            print(f"[RelationReranker] 关系模型加载失败: {e}")
 
     @staticmethod
     def _mark_text(sentence: str, subject: str, obj: str) -> str:
