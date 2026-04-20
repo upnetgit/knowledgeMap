@@ -130,6 +130,15 @@ def _load_entity_choices() -> Dict[str, List[str]]:
     }
 
 
+def _as_text_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_text(item) for item in value if _safe_text(item)]
+    text = _safe_text(value)
+    return [text] if text else []
+
+
 def _normalize_multi_values(payload: Dict[str, Any], list_key: str, single_key: str) -> List[str]:
     """兼容数组和单值字段，输出去重后的字符串列表。"""
     values: List[str] = []
@@ -276,6 +285,8 @@ class Neo4jQuery:
             ' '.join(record.get('course_tags', []) or []),
             ' '.join(record.get('ideology_tags', []) or []),
             ' '.join(record.get('teaching_objectives', []) or []),
+            ' '.join(record.get('knowledge_points', []) or []),
+            ' '.join(record.get('videos', []) or []),
         ]
         return _safe_text(' '.join(str(part) for part in parts if part))
 
@@ -442,6 +453,20 @@ class Neo4jQuery:
             return min(0.16, 0.16 * self.semantic.similarity(objective, text))
         return 0.08 if _safe_text(objective) in _safe_text(text) else 0.0
 
+    def _tag_bonus(self, query_value: Optional[str], tags: Any, per_hit: float = 0.04, cap: float = 0.12) -> float:
+        if not query_value or not tags:
+            return 0.0
+        query_text = _safe_text(query_value)
+        if not query_text:
+            return 0.0
+        hits = 0
+        for tag in _as_text_list(tags):
+            if not tag:
+                continue
+            if query_text in tag or tag in query_text:
+                hits += 1
+        return min(cap, per_hit * hits)
+
     def _build_risk_and_suggestion(self, item: Dict,
                                    stage: Optional[str],
                                    duration: Optional[float],
@@ -494,46 +519,94 @@ class Neo4jQuery:
         labels = item.get('labels', []) or []
         similarity = float(item.get('similarity') or 0.0)
         relation_bonus = {
-            'SIMILAR': 0.18,
+            'SIMILAR': 0.08,
             'RELATED': 0.12,
             'MENTIONS': 0.10,
-            'LINKS_TO_CASE': 0.15,
+            'LINKS_TO_CASE': 0.16,
             'MEDIA_LINKED_IMAGE': 0.08,
             'MEDIA_LINKED_VIDEO': 0.08,
+            'CASE_SUPPORTS': 0.15,
+            'COMPUTER_REFLECTS_IDEOLOGY': 0.14,
         }.get(relation, 0.05)
-        label_bonus = 0.15 if 'TeachingCase' in labels else 0.08 if 'Media' in labels else 0.04
-        score = min(1.0, 0.45 * similarity + relation_bonus + label_bonus)
+        label_bonus = 0.12 if 'TeachingCase' in labels else 0.07 if 'Media' in labels else 0.04
 
-        if self.semantic and focus:
-            score = min(1.0, score + 0.20 * self.semantic.similarity(focus, text))
-        elif focus:
-            score = min(1.0, score + 0.08 * (1.0 if focus in text else 0.0))
+        stage_bonus = self._stage_match_bonus(text, stage)
+        duration_bonus = self._duration_bonus(item, duration)
+        course_bonus = self._course_bonus(text, course)
+        prereq_bonus = self._prerequisite_bonus(text, prerequisites)
+        objective_bonus = self._objective_bonus(text, objective)
 
-        score = min(1.0, score + self._stage_match_bonus(text, stage))
-        score = min(1.0, score + self._duration_bonus(item, duration))
-        score = min(1.0, score + self._course_bonus(text, course))
-        score = min(1.0, score + self._prerequisite_bonus(text, prerequisites))
-        score = min(1.0, score + self._objective_bonus(text, objective))
+        focus_bonus = 0.0
+        if focus:
+            focus_text = ' '.join(_as_text_list(item.get('ideology_tags')) + _as_text_list(item.get('teaching_objectives')) + [text])
+            if self.semantic:
+                focus_bonus = min(0.18, 0.18 * self.semantic.similarity(focus, focus_text))
+            else:
+                focus_bonus = 0.10 if _safe_text(focus) in focus_text else 0.0
+            focus_bonus += self._tag_bonus(focus, item.get('ideology_tags'), per_hit=0.05, cap=0.12)
+
+        audience_bonus = 0.0
+        if audience:
+            audience_text = ' '.join([text] + _as_text_list(item.get('stage_tags')) + _as_text_list(item.get('course_tags')))
+            if self.semantic:
+                audience_bonus = min(0.10, 0.10 * self.semantic.similarity(audience, audience_text))
+            else:
+                audience_bonus = 0.06 if _safe_text(audience) in audience_text else 0.0
+
+        constraints_bonus = 0.0
+        if constraints:
+            constraints_text = ' '.join([text] + _as_text_list(item.get('teaching_objectives')) + _as_text_list(item.get('ideology_tags')))
+            if self.semantic:
+                constraints_bonus = min(0.08, 0.08 * self.semantic.similarity(constraints, constraints_text))
+            else:
+                constraints_bonus = 0.04 if _safe_text(constraints) in constraints_text else 0.0
+
+        scenario_tag_bonus = 0.0
+        scenario_tag_bonus += self._tag_bonus(stage, item.get('stage_tags'), per_hit=0.05, cap=0.12)
+        scenario_tag_bonus += self._tag_bonus(course, item.get('course_tags'), per_hit=0.05, cap=0.12)
+        scenario_tag_bonus += self._tag_bonus(objective, item.get('teaching_objectives'), per_hit=0.04, cap=0.10)
+
+        media_bonus = 0.0
+        if 'TeachingCase' in labels:
+            media_bonus = 0.15
+        elif 'Video' in labels:
+            media_bonus = 0.10
+        elif 'Image' in labels:
+            media_bonus = 0.06
+        elif 'Media' in labels:
+            media_bonus = 0.08
+
+        score = 0.12 * similarity + relation_bonus + label_bonus
+        score = min(1.0, score + stage_bonus + duration_bonus + course_bonus + prereq_bonus + objective_bonus)
+        score = min(1.0, score + focus_bonus + audience_bonus + constraints_bonus + scenario_tag_bonus + media_bonus)
 
         reason_parts = [f"关系:{relation}"]
         if 'TeachingCase' in labels:
-            reason_parts.append('教学案例')
+            reason_parts.append('教学案例节点')
         elif 'Video' in labels:
             reason_parts.append('视频媒体')
         elif 'Image' in labels:
             reason_parts.append('图像媒体')
         if stage:
             reason_parts.append(f"适配学段:{stage}")
+        if item.get('stage_tags'):
+            reason_parts.append(f"节点学段:{'/'.join(_as_text_list(item.get('stage_tags'))[:3])}")
         if duration:
             reason_parts.append(f"时长参考:{duration}")
         if focus:
             reason_parts.append(f"思政侧重:{focus}")
+        if item.get('ideology_tags'):
+            reason_parts.append(f"思政标签:{'/'.join(_as_text_list(item.get('ideology_tags'))[:3])}")
         if course:
             reason_parts.append(f"课程:{course}")
+        if item.get('course_tags'):
+            reason_parts.append(f"课程标签:{'/'.join(_as_text_list(item.get('course_tags'))[:3])}")
         if prerequisites:
             reason_parts.append(f"先修:{'/'.join(prerequisites[:3])}")
         if objective:
             reason_parts.append(f"目标:{objective}")
+        if item.get('teaching_objectives'):
+            reason_parts.append(f"节点目标:{'/'.join(_as_text_list(item.get('teaching_objectives'))[:3])}")
         if audience:
             reason_parts.append(f"对象:{audience}")
         if constraints:
@@ -681,7 +754,12 @@ class Neo4jQuery:
                            coalesce(node.media_type, '') AS media_type,
                            coalesce(node.summary, '') AS summary,
                            coalesce(node.path, '') AS path,
+                           coalesce(node.media_url, '') AS media_url,
                            coalesce(node.caption, '') AS caption,
+                           coalesce(node.knowledge_points, []) AS knowledge_points,
+                           coalesce(node.knowledge_point_count, 0) AS knowledge_point_count,
+                           coalesce(node.videos, []) AS videos,
+                           coalesce(node.video_count, 0) AS video_count,
                            COUNT { (node)--() } AS connections
                     """,
                     entity=resolved_entity,
@@ -716,7 +794,12 @@ class Neo4jQuery:
                         'media_type': media,
                         'summary': record.get('summary', ''),
                         'path': record.get('path', ''),
+                        'media_url': record.get('media_url', ''),
                         'caption': record.get('caption', ''),
+                        'knowledge_points': record.get('knowledge_points', []),
+                        'knowledge_point_count': record.get('knowledge_point_count', 0),
+                        'videos': record.get('videos', []),
+                        'video_count': record.get('video_count', 0),
                     })
                     node_names.append(name)
                     media_distribution[media] = media_distribution.get(media, 0) + 1
@@ -783,7 +866,12 @@ class Neo4jQuery:
                            coalesce(n.media_type, '') as media_type,
                            coalesce(n.summary, '') as summary,
                            coalesce(n.path, '') as path,
+                           coalesce(n.media_url, '') as media_url,
                            coalesce(n.caption, '') as caption,
+                           coalesce(n.knowledge_points, []) as knowledge_points,
+                           coalesce(n.knowledge_point_count, 0) as knowledge_point_count,
+                           coalesce(n.videos, []) as videos,
+                           coalesce(n.video_count, 0) as video_count,
                            COUNT { (n)--() } as connections
                     LIMIT 300
                 """)
@@ -810,7 +898,12 @@ class Neo4jQuery:
                         'media_type': record['media_type'],
                         'summary': record['summary'],
                         'path': record['path'],
+                        'media_url': record.get('media_url', ''),
                         'caption': record['caption'],
+                        'knowledge_points': record.get('knowledge_points', []),
+                        'knowledge_point_count': record.get('knowledge_point_count', 0),
+                        'videos': record.get('videos', []),
+                        'video_count': record.get('video_count', 0),
                     })
 
                 edges_result = session.run("""
@@ -883,6 +976,10 @@ class Neo4jQuery:
                            coalesce(b.course_tags, []) as course_tags,
                            coalesce(b.ideology_tags, []) as ideology_tags,
                            coalesce(b.teaching_objectives, []) as teaching_objectives,
+                           coalesce(b.knowledge_points, []) as knowledge_points,
+                           coalesce(b.knowledge_point_count, 0) as knowledge_point_count,
+                           coalesce(b.videos, []) as videos,
+                           coalesce(b.video_count, 0) as video_count,
                            coalesce(b.chapter_count, 0) as chapter_count,
                            coalesce(b.isbn, '') as isbn,
                            coalesce(b.frame_count, 0) as frame_count,
@@ -956,6 +1053,10 @@ class Neo4jQuery:
                             'stage_tags': item.get('stage_tags', []),
                             'course_tags': item.get('course_tags', []),
                             'ideology_tags': item.get('ideology_tags', []),
+                            'knowledge_points': item.get('knowledge_points', []),
+                            'knowledge_point_count': item.get('knowledge_point_count', 0),
+                            'videos': item.get('videos', []),
+                            'video_count': item.get('video_count', 0),
                             'score': score,
                             'reason': reason,
                             'risk_note': risk_note,
@@ -1027,6 +1128,10 @@ class Neo4jQuery:
                             'stage_tags': item.get('stage_tags', []),
                             'course_tags': item.get('course_tags', []),
                             'ideology_tags': item.get('ideology_tags', []),
+                            'knowledge_points': item.get('knowledge_points', []),
+                            'knowledge_point_count': item.get('knowledge_point_count', 0),
+                            'videos': item.get('videos', []),
+                            'video_count': item.get('video_count', 0),
                             'teaching_objectives': item.get('teaching_objectives', []),
                             'chapter_count': item.get('chapter_count', 0),
                             'isbn': item.get('isbn', ''),
@@ -1495,22 +1600,22 @@ def shutdown_session(exception=None):
 
 
 if __name__ == '__main__':
-    app.config['NEO4J_URI'] = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
+    app.config['NEO4J_URI'] = os.getenv('NEO4J_URI', 'bolt://localhost:6006')
     app.config['NEO4J_USERNAME'] = os.getenv('NEO4J_USERNAME')
     app.config['NEO4J_USER'] = os.getenv('NEO4J_USER', 'neo4j')
     app.config['NEO4J_PASSWORD'] = os.getenv('NEO4J_PASSWORD', 'password')
     app.config['NEO4J_DATABASE'] = os.getenv('NEO4J_DATABASE', 'neo4j')
     app.config['QUERY_BERT_MODEL_DIR'] = os.getenv('QUERY_BERT_MODEL_DIR', '')
-    app.config['QUERY_BERT_PROFILE'] = os.getenv('QUERY_BERT_PROFILE', 'bert_cn_base')
+    app.config['QUERY_BERT_PROFILE'] = os.getenv('QUERY_BERT_PROFILE', 'bert_cn_finetuned')
     app.config['QUERY_DEVICE_MODE'] = os.getenv('QUERY_DEVICE_MODE', 'cpu')
     app.config['ENABLE_MANUAL_ANNOTATION'] = os.getenv('ENABLE_MANUAL_ANNOTATION', 'false').lower() in {'1', 'true', 'yes', 'on'}
 
     logger.info("启动Flask服务器...")
-    logger.info("访问: http://localhost:5000")
+    logger.info("访问: http://localhost:6006")
     logger.info(f"人工标注页面: {'已启用' if app.config['ENABLE_MANUAL_ANNOTATION'] else '未启用'}")
     logger.info(f"查询语义模型档位: {app.config.get('QUERY_BERT_PROFILE', 'bert_cn_base')}")
     logger.info(f"查询语义设备: {app.config.get('QUERY_DEVICE_MODE', 'cpu')}")
     if app.config['QUERY_BERT_MODEL_DIR']:
         logger.info(f"查询语义模型: {app.config['QUERY_BERT_MODEL_DIR']}")
 
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=6006)
