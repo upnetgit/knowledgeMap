@@ -83,7 +83,10 @@ class KGBuilder:
         
         # 初始化处理器
         try:
-            from LOCAL_MODEL_MANAGER import LocalModelManager
+            local_model_module = importlib.import_module('LOCAL_MODEL_MANAGER')
+            LocalModelManager = getattr(local_model_module, 'LocalModelManager', None)
+            if LocalModelManager is None:
+                raise ImportError('LOCAL_MODEL_MANAGER.LocalModelManager not found')
 
             model_manager = LocalModelManager(project_root=str(Path(__file__).resolve().parents[2]))
             preferred_model = model_manager.get_preferred_spacy_model(language=language, auto_install=True)
@@ -414,11 +417,12 @@ class KGBuilder:
         """
         for node_name, attrs in list(self.graph.nodes(data=True)):
             labels = set(self._node_labels(node_name, attrs))
-            if 'KnowledgePoint' not in labels and 'IdeologyElement' not in labels:
+            if 'KnowledgePoint' not in labels and 'IdeologyElement' not in labels and 'TeachingCase' not in labels:
                 continue
 
             case_names = set(str(item).strip() for item in attrs.get('teaching_cases', []) if str(item).strip())
             video_names = set(str(item).strip() for item in attrs.get('videos', []) if str(item).strip())
+            knowledge_points = set(str(item).strip() for item in attrs.get('knowledge_points', []) if str(item).strip())
 
             neighbors = set(self.graph.successors(node_name)) | set(self.graph.predecessors(node_name))
             for neighbor in neighbors:
@@ -426,12 +430,16 @@ class KGBuilder:
                 neighbor_labels = set(self._node_labels(neighbor, neighbor_attrs))
                 if 'TeachingCase' in neighbor_labels:
                     case_names.add(str(neighbor))
+                if 'KnowledgePoint' in neighbor_labels:
+                    knowledge_points.add(str(neighbor))
                 if 'Video' in neighbor_labels:
                     video_names.add(str(neighbor))
 
             attrs['teaching_cases'] = sorted(case_names)
+            attrs['knowledge_points'] = sorted(knowledge_points)
             attrs['videos'] = sorted(video_names)
             attrs['teaching_case_count'] = len(attrs['teaching_cases'])
+            attrs['knowledge_point_count'] = len(attrs['knowledge_points'])
             attrs['video_count'] = len(attrs['videos'])
             # 图像数和媒体计数已从属性中获取
             attrs['media_count'] = attrs.get('image_count', 0) + attrs['video_count']
@@ -967,6 +975,7 @@ class KGBuilder:
 
         # 拼音匹配兜底（可选）
         if len(matches) < top_k:
+            pinyin = None
             try:
                 import pinyin
                 for caption_entity in caption_entities:
@@ -992,15 +1001,26 @@ class KGBuilder:
         """把文本语料建成教学案例节点，并与知识点/思政元素相连。"""
         case_relations = {}
         for case_name, case_info in self.case_records.items():
+            knowledge_points = sorted({
+                entity for entity in case_info.get('entities', [])
+                if entity in known_entities and known_entities.get(entity, {}).get('type') == 'computer_science'
+            })
             self.graph.add_node(
                 case_name,
                 type='teaching_case',
                 labels=['Entity', 'TeachingCase'],
+                case_id=case_name,
+                node_kind='teaching_case',
                 title=case_info.get('title', case_name),
                 summary=case_info.get('summary', ''),
                 keywords=case_info.get('keywords', []),
                 source_file=case_info.get('source_file', ''),
                 media_type='text',
+                media_url='',
+                knowledge_points=knowledge_points,
+                knowledge_point_count=len(knowledge_points),
+                videos=[],
+                video_count=0,
                 stage_tags=case_info.get('stage_tags', []),
                 course_tags=case_info.get('course_tags', []),
                 ideology_tags=case_info.get('ideology_tags', []),
@@ -1057,6 +1077,12 @@ class KGBuilder:
                     'similarity': float(item['score']),
                     'summary': case_info.get('summary', ''),
                 }
+
+            case_attrs = self.graph.nodes[case_name]
+            case_attrs['knowledge_points'] = knowledge_points
+            case_attrs['knowledge_point_count'] = len(knowledge_points)
+            case_attrs['videos'] = sorted(set(str(item).strip() for item in case_attrs.get('videos', []) if str(item).strip()))
+            case_attrs['video_count'] = len(case_attrs['videos'])
 
         self._save_relations_to_json(case_relations, os.path.join(output_dir, 'teaching_case_relations.json'))
 
@@ -1406,12 +1432,27 @@ class KGBuilder:
                 )
                 if best_case and best_case[0]['score'] >= 0.35:
                     case_name = best_case[0]['name']
+                    if self.graph.has_node(case_name):
+                        case_attrs = self.graph.nodes[case_name]
+                        videos = set(str(item).strip() for item in case_attrs.get('videos', []) if str(item).strip())
+                        videos.add(video_name)
+                        case_attrs['videos'] = sorted(videos)
+                        case_attrs['video_count'] = len(case_attrs['videos'])
                     self.graph.add_edge(video_name, case_name,
                                       relation='LINKS_TO_CASE',
                                       similarity=float(best_case[0]['score']),
                                       caption=caption,
                                       media_type='video')
                     self.relations['LINKS_TO_CASE'].append((video_name, case_name, float(best_case[0]['score'])))
+                    self.graph.add_edge(case_name, video_name,
+                                      relation='CASE_SUPPORTS',
+                                      similarity=float(best_case[0]['score']),
+                                      caption=caption,
+                                      media_path=clip_path or video_path,
+                                      media_url=clip_url or video_url,
+                                      clip_path=clip_path,
+                                      media_type='video')
+                    self.relations['CASE_SUPPORTS'].append((case_name, video_name, float(best_case[0]['score'])))
                     video_relations[f'{video_name}--{case_name}'] = {
                         'media': video_name,
                         'case': case_name,
@@ -1419,6 +1460,16 @@ class KGBuilder:
                         'relation': 'LINKS_TO_CASE',
                         'similarity': float(best_case[0]['score']),
                         'caption': caption,
+                    }
+                    video_relations[f'{case_name}--{video_name}--supports'] = {
+                        'case': case_name,
+                        'media': video_name,
+                        'media_type': 'video',
+                        'relation': 'CASE_SUPPORTS',
+                        'similarity': float(best_case[0]['score']),
+                        'caption': caption,
+                        'media_path': clip_path or video_path,
+                        'media_url': clip_url or video_url,
                     }
         
         # 保存视频关系
@@ -1455,6 +1506,8 @@ class KGBuilder:
                         'id': entity_id,
                         'created_at': datetime.now().isoformat(),
                         'node_type': attrs.get('type', attrs.get('node_type', 'entity')),
+                        'node_kind': attrs.get('node_kind', attrs.get('type', attrs.get('node_type', 'entity'))),
+                        'case_id': attrs.get('case_id', ''),
                         'labels': labels,
                         'summary': attrs.get('summary', ''),
                         'title': attrs.get('title', ''),
@@ -1476,8 +1529,10 @@ class KGBuilder:
                         'chapter_titles': attrs.get('chapter_titles', []),
                         'isbn': attrs.get('isbn', ''),
                         'teaching_cases': attrs.get('teaching_cases', []),
+                        'knowledge_points': attrs.get('knowledge_points', []),
                         'videos': attrs.get('videos', []),
                         'teaching_case_count': attrs.get('teaching_case_count', 0),
+                        'knowledge_point_count': attrs.get('knowledge_point_count', 0),
                         'video_count': attrs.get('video_count', 0),
                         'media_count': attrs.get('media_count', 0),
                         # 新增：图像作为属性而非节点
