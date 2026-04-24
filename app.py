@@ -59,6 +59,11 @@ if Flask is None or request is None or jsonify is None or render_template is Non
 
 app = Flask(__name__)
 
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv'}
+AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'}
+TEXT_EXTS = {'.txt'}
+
 
 def _safe_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -71,11 +76,29 @@ def _split_csv(value: Optional[str]) -> List[str]:
 
 
 def _sanitize_upload_filename(filename: str) -> str:
-    cleaned = str(filename or '').strip()
+    raw = str(filename or '').strip()
+    suffix = Path(raw).suffix.lower()
+    cleaned = raw
     if secure_filename:
         cleaned = secure_filename(cleaned)
-    cleaned = cleaned or f"upload_{uuid4().hex}"
+    cleaned = cleaned.strip()
+    if not cleaned:
+        cleaned = f"upload_{uuid4().hex}{suffix}"
+    elif suffix and Path(cleaned).suffix.lower() != suffix:
+        cleaned = f"{Path(cleaned).stem}{suffix}"
     return cleaned
+
+
+def _classify_media_suffix(suffix: str) -> Tuple[str, str]:
+    suffix = str(suffix or '').lower().strip()
+    if suffix in IMAGE_EXTS:
+        return 'image', 'uploads/img'
+    if suffix in VIDEO_EXTS:
+        return 'video', 'uploads/video'
+    if suffix in AUDIO_EXTS:
+        # C 方案：音频与视频走同一路由，节点层通过 source_media_type 区分。
+        return 'audio', 'uploads/video'
+    return 'unknown', ''
 
 
 def _filename_keywords(path_value: str) -> List[str]:
@@ -88,6 +111,109 @@ def _filename_keywords(path_value: str) -> List[str]:
         if len(part) >= 2:
             terms.append(part)
     return list(dict.fromkeys(terms))
+
+
+def _read_text_file(path: Path) -> str:
+    """Read text file with lightweight encoding fallback."""
+    raw = path.read_bytes()
+    for enc in ('utf-8-sig', 'utf-8', 'gb18030'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode('utf-8', errors='ignore')
+
+
+def _split_text_paragraphs(text: str, max_paragraphs: int = 40, max_len: int = 260) -> List[str]:
+    """Split text into manageable paragraphs for insertion and evidence linking."""
+    normalized = _safe_text(text)
+    if not normalized:
+        return []
+
+    coarse = [seg.strip() for seg in re.split(r"\n+|\r+", text) if _safe_text(seg)]
+    if not coarse:
+        coarse = [normalized]
+
+    chunks: List[str] = []
+    for para in coarse:
+        para = _safe_text(para)
+        if not para:
+            continue
+        if len(para) <= max_len:
+            chunks.append(para)
+            continue
+        for sentence in re.split(r"(?<=[。！？；.!?;])", para):
+            sentence = _safe_text(sentence)
+            if not sentence:
+                continue
+            if len(sentence) <= max_len:
+                chunks.append(sentence)
+                continue
+            for i in range(0, len(sentence), max_len):
+                chunks.append(sentence[i:i + max_len])
+
+    deduped: List[str] = []
+    seen = set()
+    for item in chunks:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+        if len(deduped) >= max_paragraphs:
+            break
+    return deduped
+
+
+def _extract_existing_entities_from_text(session: Any, query_engine: Any, paragraphs: List[str]) -> List[str]:
+    """Find existing entities related to text by exact mention + query term resolution."""
+    found: List[str] = []
+    seen = set()
+    snippets = [p for p in paragraphs if p][:24]
+    if not snippets:
+        return []
+
+    try:
+        result = session.run(
+            """
+            MATCH (e:Entity)
+            WHERE size(coalesce(e.name, '')) >= 2
+            WITH e, $paragraphs AS paragraphs
+            WHERE any(p IN paragraphs WHERE p CONTAINS e.name)
+            RETURN DISTINCT e.name AS name
+            LIMIT 120
+            """,
+            paragraphs=snippets,
+        )
+        for row in result:
+            name = _safe_text(row.get('name'))
+            if name and name not in seen:
+                seen.add(name)
+                found.append(name)
+    except Exception as e:
+        logger.warning(f"文本实体显式匹配失败: {e}")
+
+    resolver = getattr(query_engine, 'resolve_entity_name', None)
+    extractor = getattr(query_engine, 'extract_query_terms', None)
+    if callable(resolver) and callable(extractor):
+        for para in snippets[:16]:
+            for term in extractor(para)[:8]:
+                resolved, _alts = resolver(term)
+                resolved = _safe_text(resolved)
+                if not resolved or resolved in seen:
+                    continue
+                exists = session.run(
+                    "MATCH (e:Entity {name: $name}) RETURN COUNT(e) AS cnt",
+                    name=resolved,
+                ).single()
+                if int((exists or {}).get('cnt', 0)) > 0:
+                    seen.add(resolved)
+                    found.append(resolved)
+                if len(found) >= 120:
+                    break
+            if len(found) >= 120:
+                break
+
+    return found
 
 # 模板已迁移到 templates/index.html 与 templates/annotate.html
 
@@ -165,8 +291,8 @@ def _normalize_multi_values(payload: Dict[str, Any], list_key: str, single_key: 
 def _list_videos_for_annotation() -> List[Dict[str, str]]:
     videos: List[Dict[str, str]] = []
     data_root = _data_root()
-    suffixes = {'.mp4', '.avi', '.mov', '.mkv'}
-    for subdir in ('video', 'clips'):
+    suffixes = {'.mp4', '.avi', '.mov', '.mkv', '.ts', '.m2ts'}
+    for subdir in ('video', 'video_fixed', 'uploads/video', 'clips'):
         base = data_root / subdir
         if not base.exists():
             continue
@@ -178,8 +304,13 @@ def _list_videos_for_annotation() -> List[Dict[str, str]]:
                 'name': path.name,
                 'relative_path': relative,
                 'url': f"/media/{relative}",
+                'media_type': 'video',
+                'source_media_type': 'video',
             })
-    return videos
+    dedup: Dict[str, Dict[str, str]] = {}
+    for item in videos:
+        dedup[item['relative_path']] = item
+    return list(dedup.values())
 
 
 def _media_url_for_path(path_value: Optional[str]) -> str:
@@ -321,15 +452,15 @@ class Neo4jQuery:
                 seen.add(chunk)
 
         # 规则抽取：学段与核心主题词（对“长句问法”做稳健拆分）
-        stage_hits = re.findall(r"大[一二三四]|高[一二三]|初[一二三]|小学|初中|高中|大学|高职", compact)
+        stage_hits = re.findall(r"大[一二三四]|高[一二三]|初[一二三]|小学|初中|高中|大学|高职|基础|初级|入门|导论|概论|零基础", compact)
         for token in stage_hits:
             if token not in seen:
                 terms.append(token)
                 seen.add(token)
 
         domain_lexicon = [
-            "规范化", "编程", "代码规范", "算法", "数据结构", "数据库", "操作系统", "计算机网络", "软件工程",
-            "面向对象", "实验", "思政", "马克思主义", "创新理论", "文化建设", "核心价值体系",
+            "规范化", "编程", "编程规范", "代码规范", "程序设计", "算法", "数据结构", "数据库", "操作系统", "计算机网络", "软件工程",
+            "面向对象", "实验", "思政", "马克思主义", "创新理论", "文化建设", "核心价值体系", "大一", "基础", "初级", "入门", "导论", "概论",
         ]
         for token in domain_lexicon:
             if token in compact and token not in seen:
@@ -401,6 +532,50 @@ class Neo4jQuery:
 
                 if candidates:
                     return candidates[0], candidates[1:]
+
+                # 语义兜底：当精确/包含匹配失败时，用本地 BERT 对节点文本做排序，
+                # 让“大一编程规范”这类复合短语也能落到最相近的教学节点上。
+                if self.semantic:
+                    candidate_map: Dict[str, Dict[str, Any]] = {}
+                    semantic_result = session.run(
+                        """
+                        MATCH (n:Entity)
+                        RETURN coalesce(n.name, '') AS name,
+                               labels(n) AS labels,
+                               coalesce(n.summary, '') AS summary,
+                               coalesce(n.caption, '') AS caption,
+                               coalesce(n.source_file, '') AS source_file,
+                               coalesce(n.stage_tags, []) AS stage_tags,
+                               coalesce(n.course_tags, []) AS course_tags,
+                               coalesce(n.ideology_tags, []) AS ideology_tags,
+                               coalesce(n.teaching_objectives, []) AS teaching_objectives,
+                               coalesce(n.knowledge_points, []) AS knowledge_points,
+                               coalesce(n.videos, []) AS videos
+                        LIMIT 800
+                        """
+                    )
+                    for record in semantic_result:
+                        name = _safe_text(record.get('name'))
+                        if not name:
+                            continue
+                        candidate_map[name] = {
+                            'name': name,
+                            'labels': record.get('labels') or [],
+                            'summary': record.get('summary', ''),
+                            'caption': record.get('caption', ''),
+                            'source_file': record.get('source_file', ''),
+                            'stage_tags': record.get('stage_tags', []),
+                            'course_tags': record.get('course_tags', []),
+                            'ideology_tags': record.get('ideology_tags', []),
+                            'teaching_objectives': record.get('teaching_objectives', []),
+                            'knowledge_points': record.get('knowledge_points', []),
+                            'videos': record.get('videos', []),
+                        }
+
+                    ranked = self.semantic.rank_candidates(cleaned, candidate_map, top_k=8)
+                    semantic_candidates = [item['name'] for item in ranked if item.get('name') and float(item.get('score', 0.0)) >= 0.34]
+                    if semantic_candidates:
+                        return semantic_candidates[0], semantic_candidates[1:]
         except Exception as e:
             logger.warning(f"实体解析失败，回退原始输入: {e}")
 
@@ -414,6 +589,7 @@ class Neo4jQuery:
         if not text or not stage:
             return 0.0
         aliases = {
+            '大一': ['大一', '大1', '基础', '初级', '入门', '导论', '概论', '零基础', '启蒙'],
             '小学': ['小学', '基础', '启蒙'],
             '初中': ['初中', '中学', '基础'],
             '高中': ['高中', '中学', '综合'],
@@ -640,8 +816,7 @@ class Neo4jQuery:
                            coalesce(b.summary, '') as summary,
                            coalesce(b.path, '') as path,
                            coalesce(b.clip_path, '') as clip_path,
-                           coalesce(b.clip_url, '') as clip_url,
-                           coalesce(b.media_url, '') as media_url,
+                           coalesce(b.clip_url, '') as media_url,
                            coalesce(b.media_type, '') as media_type,
                            coalesce(b.source_file, '') as source_file,
                            coalesce(b.stage_tags, []) as stage_tags,
@@ -681,11 +856,13 @@ class Neo4jQuery:
             visited_entities = set()
             with self.driver.session(database=self.database) as session:
                 for query_term in query_terms:
-                    resolved_entity, _ = self.resolve_entity_name(query_term)
-                    if not resolved_entity or resolved_entity in visited_entities:
-                        continue
-                    visited_entities.add(resolved_entity)
-                    result = session.run("""
+                    resolved_entity, entity_candidates = self.resolve_entity_name(query_term)
+                    search_entities = [resolved_entity] + [item for item in entity_candidates if item and item != resolved_entity]
+                    for search_entity in search_entities:
+                        if not search_entity or search_entity in visited_entities:
+                            continue
+                        visited_entities.add(search_entity)
+                        result = session.run("""
                         MATCH (a {name: $entity})-[r]-(b)
                         WHERE coalesce(b.name, '') <> ''
                         RETURN b.name as entity,
@@ -708,17 +885,17 @@ class Neo4jQuery:
                                coalesce(b.isbn, '') as isbn
                         ORDER BY similarity DESC
                         LIMIT 30
-                    """, entity=resolved_entity)
+                    """, entity=search_entity)
 
-                    for record in result:
-                        item = dict(record)
-                        item['media'] = _guess_media_type(item.get('labels') or [], item.get('media_type', ''), item.get('entity', ''))
-                        if not item.get('clip_url') and item.get('clip_path'):
-                            item['clip_url'] = _media_url_for_path(item.get('clip_path', ''))
-                        item['media_url'] = _preferred_playback_url(item)
-                        item['query_term'] = query_term
-                        item['resolved_entity'] = resolved_entity
-                        all_items.append(item)
+                        for record in result:
+                            item = dict(record)
+                            item['media'] = _guess_media_type(item.get('labels') or [], item.get('media_type', ''), item.get('entity', ''))
+                            if not item.get('clip_url') and item.get('clip_path'):
+                                item['clip_url'] = _media_url_for_path(item.get('clip_path', ''))
+                            item['media_url'] = _preferred_playback_url(item)
+                            item['query_term'] = query_term
+                            item['resolved_entity'] = search_entity
+                            all_items.append(item)
 
             dedup: Dict[str, Dict] = {}
             for item in all_items:
@@ -957,7 +1134,10 @@ class Neo4jQuery:
         try:
             resolved_entity, entity_candidates = self.resolve_entity_name(entity)
             with self.driver.session(database=self.database) as session:
-                result = session.run("""
+                search_entities = [resolved_entity] + [item for item in entity_candidates if item and item != resolved_entity]
+                items: List[Dict] = []
+                for search_entity in search_entities:
+                    result = session.run("""
                     MATCH (a {name: $entity})-[r]-(b)
                     WHERE coalesce(b.name, '') <> ''
                     RETURN b.name as entity,
@@ -968,8 +1148,7 @@ class Neo4jQuery:
                            coalesce(b.summary, '') as summary,
                            coalesce(b.path, '') as path,
                            coalesce(b.clip_path, '') as clip_path,
-                           coalesce(b.clip_url, '') as clip_url,
-                           coalesce(b.media_url, '') as media_url,
+                           coalesce(b.clip_url, '') as media_url,
                            coalesce(b.media_type, '') as media_type,
                            coalesce(b.source_file, '') as source_file,
                            coalesce(b.stage_tags, []) as stage_tags,
@@ -985,12 +1164,15 @@ class Neo4jQuery:
                            coalesce(b.frame_count, 0) as frame_count,
                            coalesce(b.fps, 0) as fps,
                            coalesce(b.width, 0) as width,
-                           coalesce(b.height, 0) as height
+                           coalesce(b.height, 0) as height,
+                           coalesce(b.image_paths, []) as image_paths,
+                           coalesce(b.image_captions, []) as image_captions,
+                           coalesce(b.image_ocr_texts, []) as image_ocr_texts
                     LIMIT 100
-                """, entity=resolved_entity)
+                """, entity=search_entity)
 
-                items = [dict(record) for record in result]
-                items.extend(self._query_two_hop_candidates(resolved_entity, limit=max(50, top_k * 12)))
+                    items.extend(dict(record) for record in result)
+                    items.extend(self._query_two_hop_candidates(search_entity, limit=max(50, top_k * 12)))
 
                 dedup_items: Dict[str, Dict] = {}
                 for item in items:
@@ -1005,6 +1187,7 @@ class Neo4jQuery:
                 similar_entities = []
                 related_entities = []
                 videos = []
+                images = []
                 recommendations = []
 
                 for item in items:
@@ -1116,6 +1299,39 @@ class Neo4jQuery:
                             'suggested_use': suggested_use,
                         })
 
+                    looks_like_image_file = entity_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))
+                    if 'Image' in labels or media_type == 'image' or relation_hint == 'MEDIA_LINKED_IMAGE' or looks_like_image_file:
+                        image_url = item.get('media_url') or _media_url_for_path(item.get('path'))
+                        images.append({
+                            'name': item['entity'],
+                            'caption': item.get('caption') or item.get('summary', ''),
+                            'ocr_text': item.get('ocr_text', ''),
+                            'path': image_url,
+                            'media': 'image',
+                            'media_url': image_url,
+                            'source_file': item.get('path', ''),
+                            'score': score,
+                            'reason': reason,
+                        })
+
+                    # 兼容旧数据：历史版本图片仅写入实体属性 image_paths/image_captions/image_ocr_texts。
+                    legacy_paths = item.get('image_paths') or []
+                    legacy_caps = item.get('image_captions') or []
+                    legacy_ocrs = item.get('image_ocr_texts') or []
+                    for idx, legacy_path in enumerate(legacy_paths[:6]):
+                        legacy_url = _media_url_for_path(legacy_path)
+                        images.append({
+                            'name': f"{item['entity']}_legacy_image_{idx + 1}",
+                            'caption': legacy_caps[idx] if idx < len(legacy_caps) else item.get('summary', ''),
+                            'ocr_text': legacy_ocrs[idx] if idx < len(legacy_ocrs) else '',
+                            'path': legacy_url,
+                            'media': 'image',
+                            'media_url': legacy_url,
+                            'source_file': legacy_path,
+                            'score': score,
+                            'reason': 'legacy_entity_image_property',
+                        })
+
                     if 'TeachingCase' in labels or relation in {'LINKS_TO_CASE', 'MENTIONS'}:
                         recommendations.append({
                             'entity': item['entity'],
@@ -1144,12 +1360,23 @@ class Neo4jQuery:
                 similar_entities.sort(key=lambda x: x['similarity'], reverse=True)
                 related_entities.sort(key=lambda x: x.get('score', 0.0), reverse=True)
                 videos.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+                dedup_images: Dict[str, Dict[str, Any]] = {}
+                for image_item in images:
+                    key = _safe_text(image_item.get('media_url')) or _safe_text(image_item.get('source_file'))
+                    if not key:
+                        continue
+                    prev = dedup_images.get(key)
+                    if prev is None or float(image_item.get('score', 0.0)) > float(prev.get('score', 0.0)):
+                        dedup_images[key] = image_item
+                images = list(dedup_images.values())
+                images.sort(key=lambda x: x.get('score', 0.0), reverse=True)
                 recommendations.sort(key=lambda x: x.get('score', 0.0), reverse=True)
 
                 return {
                     'similar': similar_entities[:top_k],
                     'related': related_entities[:top_k],
                     'videos': videos[:top_k],
+                    'images': images[:top_k],
                     'recommendations': recommendations[:top_k],
                     'resolved_entity': resolved_entity,
                     'entity_candidates': entity_candidates,
@@ -1165,6 +1392,7 @@ class Neo4jQuery:
                 "similar": [],
                 "related": [],
                 "videos": [],
+                "images": [],
                 "recommendations": [],
                 "resolved_entity": entity,
                 "entity_candidates": [],
@@ -1291,6 +1519,14 @@ def annotation_save():
     except (TypeError, ValueError):
         return jsonify({'error': '数值字段格式错误'}), 400
 
+    stage_tags = _normalize_multi_values(payload, 'stage_tags', 'stage')
+    course_tags = _normalize_multi_values(payload, 'course_tags', 'course')
+    teaching_objectives = _normalize_multi_values(payload, 'teaching_objectives', 'objective')
+    lesson_phase = _safe_text(payload.get('lesson_phase'))
+    difficulty = _safe_text(payload.get('difficulty'))
+    audience = _safe_text(payload.get('audience'))
+    source_media_type = _safe_text(payload.get('source_media_type')) or _classify_media_suffix(Path(video_path).suffix.lower())[0]
+
     primary_computer = computer_entities[0] if computer_entities else 'NONE'
     primary_ideology = ideology_entities[0] if ideology_entities else 'NONE'
     annotation_id = f"{video_name}__{start_sec:.1f}_{end_sec:.1f}__{primary_computer}__{primary_ideology}"
@@ -1303,20 +1539,115 @@ def annotation_save():
         'end_sec': round(end_sec, 1),
         'computer_entities': computer_entities,
         'ideology_entities': ideology_entities,
-        # 兼容旧字段
         'computer_entity': computer_entities[0] if computer_entities else '',
         'ideology_entity': ideology_entities[0] if ideology_entities else '',
         'caption': _safe_text(payload.get('caption')),
         'ocr_text': _safe_text(payload.get('ocr_text')),
         'confidence': max(0.0, min(1.0, confidence)),
+        'stage_tags': stage_tags,
+        'course_tags': course_tags,
+        'teaching_objectives': teaching_objectives,
+        'lesson_phase': lesson_phase,
+        'difficulty': difficulty,
+        'audience': audience,
         'annotator': _safe_text(payload.get('annotator')),
+        'source_media_type': source_media_type,
         'created_at': datetime.utcnow().isoformat() + 'Z',
     }
 
     with _annotation_file().open('a', encoding='utf-8') as f:
         f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
-    return jsonify({'ok': True, 'annotation_id': annotation_id, 'record': record})
+    #保存 JSONL + 可选即时同步 Neo4j（默认）
+    sync_to_neo4j = str(payload.get('sync_to_neo4j', 'true')).strip().lower() not in {'0', 'false', 'no', 'off'}
+    sync_status = 'skipped'
+    if sync_to_neo4j:
+        query_engine = get_neo4j_query()
+        if query_engine.driver:
+            try:
+                now = datetime.utcnow().isoformat() + 'Z'
+                all_entities = list(dict.fromkeys(computer_entities + ideology_entities))
+                with query_engine.driver.session(database=query_engine.database) as session:
+                    session.run(
+                        """
+                        MERGE (v:Entity:Media:Video {name: $name})
+                        SET v.media_type = 'video',
+                            v.source_media_type = $source_media_type,
+                            v.path = $path,
+                            v.relative_path = $path,
+                            v.media_url = $media_url,
+                            v.caption = CASE WHEN $caption = '' THEN coalesce(v.caption, '') ELSE $caption END,
+                            v.ocr_text = CASE WHEN $ocr_text = '' THEN coalesce(v.ocr_text, '') ELSE $ocr_text END,
+                            v.stage_tags = CASE WHEN size($stage_tags)=0 THEN coalesce(v.stage_tags, []) ELSE $stage_tags END,
+                            v.course_tags = CASE WHEN size($course_tags)=0 THEN coalesce(v.course_tags, []) ELSE $course_tags END,
+                            v.teaching_objectives = CASE WHEN size($teaching_objectives)=0 THEN coalesce(v.teaching_objectives, []) ELSE $teaching_objectives END,
+                            v.lesson_phase = CASE WHEN $lesson_phase = '' THEN coalesce(v.lesson_phase, '') ELSE $lesson_phase END,
+                            v.difficulty = CASE WHEN $difficulty = '' THEN coalesce(v.difficulty, '') ELSE $difficulty END,
+                            v.audience = CASE WHEN $audience = '' THEN coalesce(v.audience, '') ELSE $audience END,
+                            v.updated_at = $updated_at
+                        """,
+                        name=video_name,
+                        path=video_path,
+                        media_url=f"/media/{video_path}",
+                        source_media_type=source_media_type,
+                        caption=record['caption'],
+                        ocr_text=record['ocr_text'],
+                        stage_tags=stage_tags,
+                        course_tags=course_tags,
+                        teaching_objectives=teaching_objectives,
+                        lesson_phase=lesson_phase,
+                        difficulty=difficulty,
+                        audience=audience,
+                        updated_at=now,
+                    )
+                    for entity in all_entities:
+                        session.run(
+                            """
+                            MATCH (e:Entity {name: $entity})
+                            MATCH (v:Entity {name: $video_name})
+                            MERGE (e)-[r:MEDIA_LINKED_VIDEO]->(v)
+                            SET r.similarity = CASE
+                                WHEN r.similarity IS NULL THEN $confidence
+                                WHEN r.similarity < $confidence THEN $confidence
+                                ELSE r.similarity
+                            END,
+                                r.caption = CASE WHEN $caption = '' THEN coalesce(r.caption, '') ELSE $caption END,
+                                r.ocr_text = CASE WHEN $ocr_text = '' THEN coalesce(r.ocr_text, '') ELSE $ocr_text END,
+                                r.media_path = $path,
+                                r.media_url = $media_url,
+                                r.media_type = 'video',
+                                r.annotation_source = 'manual',
+                                r.stage_tags = $stage_tags,
+                                r.course_tags = $course_tags,
+                                r.teaching_objectives = $teaching_objectives,
+                                r.lesson_phase = $lesson_phase,
+                                r.difficulty = $difficulty,
+                                r.audience = $audience,
+                                r.updated_at = $updated_at
+                            """,
+                            entity=entity,
+                            video_name=video_name,
+                            confidence=record['confidence'],
+                            caption=record['caption'],
+                            ocr_text=record['ocr_text'],
+                            path=video_path,
+                            media_url=f"/media/{video_path}",
+                            stage_tags=stage_tags,
+                            course_tags=course_tags,
+                            teaching_objectives=teaching_objectives,
+                            lesson_phase=lesson_phase,
+                            difficulty=difficulty,
+                            audience=audience,
+                            updated_at=now,
+                        )
+                sync_status = 'ok'
+            except Exception as e:
+                sync_status = f'failed: {e}'
+                logger.error(f"人工标注同步 Neo4j 失败: {e}")
+        else:
+            sync_status = 'failed: neo4j_unavailable'
+
+    return jsonify({'ok': True, 'annotation_id': annotation_id, 'record': record, 'neo4j_sync': sync_status})
 
 
 @app.route('/api/query', methods=['GET'])
@@ -1416,6 +1747,101 @@ def _match_terms(text: str, candidates: List[str]) -> List[str]:
     return list(dict.fromkeys(matched))
 
 
+def _semantic_match_terms(query_engine: Any, text: str, candidates: List[str], threshold: float = 0.36, top_k: int = 8) -> List[str]:
+    if not text or not candidates:
+        return []
+    semantic = getattr(query_engine, 'semantic', None)
+    if semantic is None:
+        return []
+    candidate_map = {term: {'name': term, 'type': 'whitelist_term'} for term in candidates if term}
+    try:
+        ranked = semantic.rank_candidates(text, candidate_map, top_k=max(top_k, 3))
+    except Exception:
+        return []
+    return [item['name'] for item in ranked if item.get('name') and float(item.get('score', 0.0)) >= threshold]
+
+
+def _collect_linked_entities(query_engine: Any, hint_text: str, whitelist: Dict[str, List[str]], media_name: str) -> List[str]:
+    computer_pool = whitelist.get('computer_entities', [])
+    ideology_pool = whitelist.get('ideology_entities', [])
+    allowed_pool = list(dict.fromkeys(computer_pool + ideology_pool))
+
+    linked = set(_match_terms(hint_text, allowed_pool))
+    linked.update(_semantic_match_terms(query_engine, hint_text, allowed_pool))
+
+    if hasattr(query_engine, 'extract_query_terms') and hasattr(query_engine, 'resolve_entity_name'):
+        try:
+            for term in query_engine.extract_query_terms(hint_text)[:10]:
+                resolved, alternatives = query_engine.resolve_entity_name(term)
+                for name in [resolved] + alternatives[:2]:
+                    if name and name in allowed_pool:
+                        linked.add(name)
+        except Exception as e:
+            logger.warning(f"实体自动建边候选解析失败: {e}")
+
+    linked.discard(media_name)
+    return sorted(linked)
+
+
+def _score_image_entity_relevance(query_engine: Any,
+                                  entity_name: str,
+                                  caption: str,
+                                  ocr_text: str,
+                                  filename_terms: List[str]) -> float:
+    """Score image-to-entity relevance for optional image-node ingestion."""
+    entity = _safe_text(entity_name)
+    context_text = _safe_text(' '.join([caption or '', ocr_text or '', ' '.join(filename_terms or [])]))
+    if not entity or not context_text:
+        return 0.0
+
+    term_hit = 1.0 if entity in context_text else 0.0
+    filename_hit = 1.0 if entity in _safe_text(' '.join(filename_terms or [])) else 0.0
+
+    semantic = 0.0
+    semantic_engine = getattr(query_engine, 'semantic', None)
+    if semantic_engine:
+        try:
+            semantic = float(semantic_engine.similarity(entity, context_text))
+        except Exception:
+            semantic = 0.0
+
+    score = (0.6 * semantic) + (0.3 * term_hit) + (0.1 * filename_hit)
+    return max(0.0, min(1.0, round(score, 4)))
+
+
+def _rank_image_entity_candidates(query_engine: Any,
+                                  candidates: List[str],
+                                  caption: str,
+                                  ocr_text: str,
+                                  filename_terms: List[str]) -> List[Dict[str, Any]]:
+    ranked: List[Dict[str, Any]] = []
+    for entity in candidates or []:
+        score = _score_image_entity_relevance(
+            query_engine=query_engine,
+            entity_name=entity,
+            caption=caption,
+            ocr_text=ocr_text,
+            filename_terms=filename_terms,
+        )
+        evidence_parts = []
+        if entity and entity in _safe_text(caption):
+            evidence_parts.append('caption_hit')
+        if entity and entity in _safe_text(ocr_text):
+            evidence_parts.append('ocr_hit')
+        if entity and entity in _safe_text(' '.join(filename_terms or [])):
+            evidence_parts.append('filename_hit')
+        if not evidence_parts:
+            evidence_parts.append('semantic_match')
+        ranked.append({
+            'entity': entity,
+            'score': score,
+            'evidence': evidence_parts,
+        })
+
+    ranked.sort(key=lambda item: float(item.get('score', 0.0)), reverse=True)
+    return ranked
+
+
 @app.route('/api/upload_media', methods=['POST'])
 def upload_media():
     file = request.files.get('file')
@@ -1423,15 +1849,8 @@ def upload_media():
         return jsonify({'error': '缺少上传文件'}), 400
 
     suffix = Path(file.filename).suffix.lower()
-    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-    video_exts = {'.mp4', '.avi', '.mov', '.mkv'}
-    if suffix in image_exts:
-        subdir = 'uploads/img'
-        media_type = 'image'
-    elif suffix in video_exts:
-        subdir = 'uploads/video'
-        media_type = 'video'
-    else:
+    media_type, subdir = _classify_media_suffix(suffix)
+    if media_type == 'unknown':
         return jsonify({'error': f'不支持的文件类型: {suffix}'}), 400
 
     filename = _sanitize_upload_filename(file.filename)
@@ -1445,7 +1864,8 @@ def upload_media():
     return jsonify({
         'ok': True,
         'relative_path': relative_path,
-        'media_type': media_type,
+        'media_type': 'video' if media_type in {'video', 'audio'} else 'image',
+        'source_media_type': media_type,
         'media_url': f"/media/{relative_path}",
     })
 
@@ -1467,9 +1887,10 @@ def ingest_media():
         return jsonify({'error': '文件不存在'}), 404
 
     suffix = abs_path.suffix.lower()
-    is_video = suffix in {'.mp4', '.avi', '.mov', '.mkv'}
-    is_image = suffix in {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-    if not is_video and not is_image:
+    source_media_type, _ = _classify_media_suffix(suffix)
+    is_video = source_media_type in {'video', 'audio'}
+    is_image = source_media_type == 'image'
+    if source_media_type == 'unknown':
         return jsonify({'error': '暂不支持的媒体类型'}), 400
 
     generator = get_caption_generator()
@@ -1481,9 +1902,6 @@ def ingest_media():
     whitelist = _load_ingest_whitelist()
     filename_terms = _filename_keywords(relative_path)
     hint_text = ' '.join([caption or '', ocr_text or '', ' '.join(filename_terms)])
-    computer_hits = _match_terms(hint_text, whitelist.get('computer_entities', []))
-    ideology_hits = _match_terms(hint_text, whitelist.get('ideology_entities', []))
-    linked_entities = list(dict.fromkeys(computer_hits + ideology_hits))
 
     query_engine = get_neo4j_query()
     if not query_engine.driver:
@@ -1491,12 +1909,15 @@ def ingest_media():
 
     media_url = f"/media/{relative_path}"
     media_name = abs_path.name
+    linked_entities = _collect_linked_entities(query_engine, hint_text, whitelist, media_name=media_name)
+
     with query_engine.driver.session(database=query_engine.database) as session:
         if is_video:
             session.run(
                 """
                 MERGE (v:Entity:Media:Video {name: $name})
                 SET v.media_type = 'video',
+                    v.source_media_type = $source_media_type,
                     v.path = $path,
                     v.relative_path = $relative_path,
                     v.media_url = $media_url,
@@ -1508,6 +1929,7 @@ def ingest_media():
                 relative_path=relative_path,
                 media_url=media_url,
                 caption=caption or '',
+                source_media_type=source_media_type,
                 updated_at=datetime.utcnow().isoformat() + 'Z',
             )
             for entity in linked_entities:
@@ -1521,6 +1943,7 @@ def ingest_media():
                         r.media_path = $relative_path,
                         r.media_url = $media_url,
                         r.media_type = 'video',
+                        r.source_media_type = $source_media_type,
                         r.updated_at = $updated_at
                     """,
                     entity=entity,
@@ -1528,45 +1951,347 @@ def ingest_media():
                     caption=caption or '',
                     relative_path=relative_path,
                     media_url=media_url,
+                    source_media_type=source_media_type,
                     updated_at=datetime.utcnow().isoformat() + 'Z',
                 )
-        else:
-            for entity in linked_entities:
+        elif is_image:
+            image_node_enable = bool(app.config.get('ENABLE_IMAGE_NODE_INGEST', True))
+            image_node_threshold = float(app.config.get('IMAGE_NODE_MIN_SIMILARITY', 0.50) or 0.50)
+            image_node_topk = max(1, int(app.config.get('IMAGE_NODE_MAX_LINKS', 3) or 3))
+
+            ranked_candidates = _rank_image_entity_candidates(
+                query_engine=query_engine,
+                candidates=linked_entities,
+                caption=caption or '',
+                ocr_text=ocr_text or '',
+                filename_terms=filename_terms,
+            )
+            high_related = [
+                item for item in ranked_candidates
+                if float(item.get('score', 0.0)) >= image_node_threshold
+            ][:image_node_topk]
+
+            if image_node_enable and high_related:
                 session.run(
                     """
-                    MATCH (e:Entity {name: $entity})
-                    SET e.image_captions = CASE
-                        WHEN $caption = '' THEN coalesce(e.image_captions, [])
-                        WHEN $caption IN coalesce(e.image_captions, []) THEN coalesce(e.image_captions, [])
-                        ELSE coalesce(e.image_captions, []) + $caption
-                    END,
-                    e.image_ocr_texts = CASE
-                        WHEN $ocr_text = '' THEN coalesce(e.image_ocr_texts, [])
-                        WHEN $ocr_text IN coalesce(e.image_ocr_texts, []) THEN coalesce(e.image_ocr_texts, [])
-                        ELSE coalesce(e.image_ocr_texts, []) + $ocr_text
-                    END,
-                    e.image_paths = CASE
-                        WHEN $relative_path IN coalesce(e.image_paths, []) THEN coalesce(e.image_paths, [])
-                        ELSE coalesce(e.image_paths, []) + $relative_path
-                    END,
-                    e.image_count = size(coalesce(e.image_paths, [])),
-                    e.updated_at = $updated_at
+                    MERGE (i:Entity:Media:Image {name: $name})
+                    SET i.media_type = 'image',
+                        i.source_media_type = 'image',
+                        i.path = $path,
+                        i.relative_path = $relative_path,
+                        i.media_url = $media_url,
+                        i.caption = CASE WHEN $caption = '' THEN coalesce(i.caption, '') ELSE $caption END,
+                        i.ocr_text = CASE WHEN $ocr_text = '' THEN coalesce(i.ocr_text, '') ELSE $ocr_text END,
+                        i.updated_at = $updated_at
                     """,
-                    entity=entity,
+                    name=media_name,
+                    path=relative_path,
+                    relative_path=relative_path,
+                    media_url=media_url,
                     caption=caption or '',
                     ocr_text=ocr_text or '',
-                    relative_path=relative_path,
                     updated_at=datetime.utcnow().isoformat() + 'Z',
                 )
+
+                for item in high_related:
+                    session.run(
+                        """
+                        MATCH (e:Entity {name: $entity})
+                        MATCH (i:Entity:Image {name: $image_name})
+                        MERGE (e)-[r:MEDIA_LINKED_IMAGE]->(i)
+                        SET r.similarity = CASE
+                            WHEN r.similarity IS NULL THEN $score
+                            WHEN r.similarity < $score THEN $score
+                            ELSE r.similarity
+                        END,
+                            r.caption = CASE WHEN $caption = '' THEN coalesce(r.caption, '') ELSE $caption END,
+                            r.ocr_text = CASE WHEN $ocr_text = '' THEN coalesce(r.ocr_text, '') ELSE $ocr_text END,
+                            r.media_path = $relative_path,
+                            r.media_url = $media_url,
+                            r.media_type = 'image',
+                            r.evidence = $evidence,
+                            r.updated_at = $updated_at
+                        """,
+                        entity=item['entity'],
+                        image_name=media_name,
+                        score=float(item.get('score', 0.0)),
+                        caption=caption or '',
+                        ocr_text=ocr_text or '',
+                        relative_path=relative_path,
+                        media_url=media_url,
+                        evidence=item.get('evidence', []),
+                        updated_at=datetime.utcnow().isoformat() + 'Z',
+                    )
+            else:
+                for entity in linked_entities:
+                    session.run(
+                        """
+                        MATCH (e:Entity {name: $entity})
+                        SET e.image_captions = CASE
+                            WHEN $caption = '' THEN coalesce(e.image_captions, [])
+                            WHEN $caption IN coalesce(e.image_captions, []) THEN coalesce(e.image_captions, [])
+                            ELSE coalesce(e.image_captions, []) + $caption
+                        END,
+                        e.image_ocr_texts = CASE
+                            WHEN $ocr_text = '' THEN coalesce(e.image_ocr_texts, [])
+                            WHEN $ocr_text IN coalesce(e.image_ocr_texts, []) THEN coalesce(e.image_ocr_texts, [])
+                            ELSE coalesce(e.image_ocr_texts, []) + $ocr_text
+                        END,
+                        e.image_paths = CASE
+                            WHEN $relative_path IN coalesce(e.image_paths, []) THEN coalesce(e.image_paths, [])
+                            ELSE coalesce(e.image_paths, []) + $relative_path
+                        END,
+                        e.image_count = size(coalesce(e.image_paths, [])),
+                        e.updated_at = $updated_at
+                        """,
+                        entity=entity,
+                        caption=caption or '',
+                        ocr_text=ocr_text or '',
+                        relative_path=relative_path,
+                        updated_at=datetime.utcnow().isoformat() + 'Z',
+                    )
+
+    image_top_entities = []
+    if is_image:
+        image_ranked = _rank_image_entity_candidates(
+            query_engine=query_engine,
+            candidates=linked_entities,
+            caption=caption or '',
+            ocr_text=ocr_text or '',
+            filename_terms=filename_terms,
+        )
+        image_top_entities = image_ranked[:max(1, int(app.config.get('IMAGE_NODE_MAX_LINKS', 3) or 3))]
+
+    primary_entity = linked_entities[0] if linked_entities else ''
 
     return jsonify({
         'ok': True,
         'summary': f"{media_name} 已处理，匹配实体 {len(linked_entities)} 个",
         'media_type': 'video' if is_video else 'image',
+        'source_media_type': source_media_type,
         'caption': caption,
         'ocr_text': ocr_text,
         'linked_entities': linked_entities,
+        'primary_entity': primary_entity,
+        'image_top_entities': image_top_entities,
         'filename_terms': filename_terms,
+    })
+
+
+@app.route('/api/upload_text', methods=['POST'])
+def upload_text():
+    file = request.files.get('file')
+    if file is None or not file.filename:
+        return jsonify({'error': '缺少上传文件'}), 400
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in TEXT_EXTS:
+        return jsonify({'error': f'仅支持文本文件: {", ".join(sorted(TEXT_EXTS))}'}), 400
+
+    filename = _sanitize_upload_filename(file.filename)
+    if Path(filename).suffix.lower() != '.txt':
+        filename = f"{Path(filename).stem}.txt"
+
+    data_root = _data_root()
+    abs_dir = data_root / 'uploads' / 'txt'
+    abs_dir.mkdir(parents=True, exist_ok=True)
+    target_path = abs_dir / filename
+    file.save(str(target_path))
+
+    relative_path = target_path.relative_to(data_root).as_posix()
+    return jsonify({
+        'ok': True,
+        'relative_path': relative_path,
+        'media_type': 'text',
+    })
+
+
+@app.route('/api/ingest_text', methods=['POST'])
+def ingest_text():
+    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    relative_path = _safe_text(payload.get('relative_path'))
+    if not relative_path:
+        return jsonify({'error': 'relative_path 不能为空'}), 400
+
+    data_root = _data_root().resolve()
+    abs_path = (data_root / relative_path).resolve()
+    try:
+        abs_path.relative_to(data_root)
+    except Exception:
+        return jsonify({'error': '非法路径'}), 400
+    if not abs_path.exists() or not abs_path.is_file():
+        return jsonify({'error': '文件不存在'}), 404
+    if abs_path.suffix.lower() not in TEXT_EXTS:
+        return jsonify({'error': '仅支持 .txt 文本入图'}), 400
+
+    try:
+        raw_text = _read_text_file(abs_path)
+    except Exception as e:
+        return jsonify({'error': f'读取文本失败: {e}'}), 400
+
+    paragraphs = _split_text_paragraphs(raw_text, max_paragraphs=40, max_len=260)
+    if not paragraphs:
+        return jsonify({'error': '文本内容为空'}), 400
+
+    query_engine = get_neo4j_query()
+    if not query_engine.driver:
+        return jsonify({'error': 'Neo4j 不可用'}), 500
+
+    whitelist = _load_ingest_whitelist()
+    computer_pool = whitelist.get('computer_entities', [])
+    ideology_pool = whitelist.get('ideology_entities', [])
+    whitelist_pool = list(dict.fromkeys(computer_pool + ideology_pool))
+    whitelist_available = bool(whitelist_pool)
+
+    text_name = abs_path.name
+    full_text = ' '.join(paragraphs)
+    explicit_whitelist_hits = _match_terms(full_text, whitelist_pool)
+    semantic_whitelist_hits = _semantic_match_terms(query_engine, full_text, whitelist_pool, threshold=0.42, top_k=12)
+    whitelist_hits = list(dict.fromkeys(explicit_whitelist_hits + semantic_whitelist_hits))
+
+    created_entities: List[str] = []
+    linked_entities: List[str] = []
+    paragraph_map: Dict[str, List[str]] = {}
+    skipped_whitelist_creation = False
+
+    now = datetime.utcnow().isoformat() + 'Z'
+    with query_engine.driver.session(database=query_engine.database) as session:
+        existing_entities = _extract_existing_entities_from_text(session, query_engine, paragraphs)
+        linked_entities = list(dict.fromkeys(existing_entities))
+
+        for entity_name in linked_entities:
+            snippets = [p for p in paragraphs if entity_name in p][:5]
+            if not snippets:
+                snippets = paragraphs[:2]
+            paragraph_map[entity_name] = snippets
+
+        # C 方案：创建 TextDocument 节点，同时把文本摘要写入相关实体属性。
+        session.run(
+            """
+            MERGE (d:Entity:TextDocument {name: $name})
+            SET d.media_type = 'text',
+                d.source_media_type = 'text',
+                d.path = $relative_path,
+                d.relative_path = $relative_path,
+                d.media_url = $media_url,
+                d.full_text = $full_text,
+                d.text_paragraphs = $paragraphs,
+                d.paragraph_count = size($paragraphs),
+                d.updated_at = $updated_at
+            """,
+            name=text_name,
+            relative_path=relative_path,
+            media_url=f"/media/{relative_path}",
+            full_text=full_text[:6000],
+            paragraphs=paragraphs,
+            updated_at=now,
+        )
+
+        for entity_name in linked_entities:
+            snippets = paragraph_map.get(entity_name, [])
+            session.run(
+                """
+                MATCH (e:Entity {name: $entity_name})
+                MATCH (d:Entity:TextDocument {name: $doc_name})
+                SET e.related_text_docs = reduce(acc = coalesce(e.related_text_docs, []), x IN [$doc_name] |
+                    CASE WHEN x IN acc THEN acc ELSE acc + x END),
+                    e.related_text_snippets = reduce(acc = coalesce(e.related_text_snippets, []), x IN $snippets |
+                    CASE WHEN x IN acc THEN acc ELSE acc + x END),
+                    e.updated_at = $updated_at
+                MERGE (d)-[r:TEXT_MENTIONS]->(e)
+                SET r.similarity = CASE
+                    WHEN r.similarity IS NULL THEN 0.82
+                    WHEN r.similarity < 0.82 THEN 0.82
+                    ELSE r.similarity
+                END,
+                    r.evidence = reduce(acc = coalesce(r.evidence, []), x IN $snippets |
+                    CASE WHEN x IN acc THEN acc ELSE acc + x END),
+                    r.source = 'text_upload',
+                    r.updated_at = $updated_at
+                """,
+                entity_name=entity_name,
+                doc_name=text_name,
+                snippets=snippets,
+                updated_at=now,
+            )
+
+        # B 选项：白名单文件缺失/为空时，只做现有节点关联，不自动创建新实体。
+        if not whitelist_available:
+            skipped_whitelist_creation = True
+        else:
+            for term in whitelist_hits:
+                exists = session.run(
+                    "MATCH (e:Entity {name: $name}) RETURN COUNT(e) AS cnt",
+                    name=term,
+                ).single()
+                if int((exists or {}).get('cnt', 0)) > 0:
+                    if term not in linked_entities:
+                        linked_entities.append(term)
+                    continue
+
+                if term in computer_pool:
+                    session.run(
+                        """
+                        MERGE (e:Entity:KnowledgePoint {name: $name})
+                        SET e.media_type = coalesce(e.media_type, 'text'),
+                            e.source = 'whitelist_text_expansion',
+                            e.updated_at = $updated_at
+                        """,
+                        name=term,
+                        updated_at=now,
+                    )
+                else:
+                    session.run(
+                        """
+                        MERGE (e:Entity:IdeologyElement {name: $name})
+                        SET e.media_type = coalesce(e.media_type, 'text'),
+                            e.source = 'whitelist_text_expansion',
+                            e.updated_at = $updated_at
+                        """,
+                        name=term,
+                        updated_at=now,
+                    )
+
+                created_entities.append(term)
+                linked_entities.append(term)
+
+                snippets = [p for p in paragraphs if term in p][:4] or paragraphs[:2]
+                session.run(
+                    """
+                    MATCH (e:Entity {name: $entity_name})
+                    MATCH (d:Entity:TextDocument {name: $doc_name})
+                    MERGE (d)-[r:TEXT_MENTIONS]->(e)
+                    SET r.similarity = CASE
+                        WHEN r.similarity IS NULL THEN 0.8
+                        WHEN r.similarity < 0.8 THEN 0.8
+                        ELSE r.similarity
+                    END,
+                        r.evidence = reduce(acc = coalesce(r.evidence, []), x IN $snippets |
+                        CASE WHEN x IN acc THEN acc ELSE acc + x END),
+                        r.source = 'text_upload',
+                        r.updated_at = $updated_at
+                    """,
+                    entity_name=term,
+                    doc_name=text_name,
+                    snippets=snippets,
+                    updated_at=now,
+                )
+
+    linked_entities = sorted(list(dict.fromkeys(linked_entities)))
+    created_entities = sorted(list(dict.fromkeys(created_entities)))
+    primary_entity = created_entities[0] if created_entities else (linked_entities[0] if linked_entities else '')
+
+    return jsonify({
+        'ok': True,
+        'summary': f"{text_name} 已处理，关联实体 {len(linked_entities)} 个，新增实体 {len(created_entities)} 个",
+        'text_node': text_name,
+        'relative_path': relative_path,
+        'paragraph_count': len(paragraphs),
+        'linked_entities': linked_entities,
+        'created_entities': created_entities,
+        'primary_entity': primary_entity,
+        'whitelist_hits': whitelist_hits,
+        'skipped_whitelist_creation': skipped_whitelist_creation,
     })
 
 
@@ -1600,7 +2325,7 @@ def shutdown_session(exception=None):
 
 
 if __name__ == '__main__':
-    app.config['NEO4J_URI'] = os.getenv('NEO4J_URI', 'bolt://localhost:6006')
+    app.config['NEO4J_URI'] = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
     app.config['NEO4J_USERNAME'] = os.getenv('NEO4J_USERNAME')
     app.config['NEO4J_USER'] = os.getenv('NEO4J_USER', 'neo4j')
     app.config['NEO4J_PASSWORD'] = os.getenv('NEO4J_PASSWORD', 'password')
@@ -1608,6 +2333,9 @@ if __name__ == '__main__':
     app.config['QUERY_BERT_MODEL_DIR'] = os.getenv('QUERY_BERT_MODEL_DIR', '')
     app.config['QUERY_BERT_PROFILE'] = os.getenv('QUERY_BERT_PROFILE', 'bert_cn_finetuned')
     app.config['QUERY_DEVICE_MODE'] = os.getenv('QUERY_DEVICE_MODE', 'cpu')
+    app.config['ENABLE_IMAGE_NODE_INGEST'] = os.getenv('ENABLE_IMAGE_NODE_INGEST', 'true').lower() in {'1', 'true', 'yes', 'on'}
+    app.config['IMAGE_NODE_MIN_SIMILARITY'] = float(os.getenv('IMAGE_NODE_MIN_SIMILARITY', '0.50'))
+    app.config['IMAGE_NODE_MAX_LINKS'] = int(os.getenv('IMAGE_NODE_MAX_LINKS', '3'))
     app.config['ENABLE_MANUAL_ANNOTATION'] = os.getenv('ENABLE_MANUAL_ANNOTATION', 'false').lower() in {'1', 'true', 'yes', 'on'}
 
     logger.info("启动Flask服务器...")
@@ -1615,7 +2343,9 @@ if __name__ == '__main__':
     logger.info(f"人工标注页面: {'已启用' if app.config['ENABLE_MANUAL_ANNOTATION'] else '未启用'}")
     logger.info(f"查询语义模型档位: {app.config.get('QUERY_BERT_PROFILE', 'bert_cn_base')}")
     logger.info(f"查询语义设备: {app.config.get('QUERY_DEVICE_MODE', 'cpu')}")
+    logger.info(f"高相关图片入图: {'已启用' if app.config.get('ENABLE_IMAGE_NODE_INGEST', True) else '未启用'}")
     if app.config['QUERY_BERT_MODEL_DIR']:
         logger.info(f"查询语义模型: {app.config['QUERY_BERT_MODEL_DIR']}")
 
     app.run(debug=True, host='0.0.0.0', port=6006)
+
