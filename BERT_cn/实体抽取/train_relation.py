@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Any, Dict, List
 
 
 def _sanitize_thread_env() -> None:
@@ -30,6 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
 # ---------- 配置 ----------
+ROOT = Path(__file__).resolve().parent
 DEFAULT_LOCAL_MODEL_DIR = Path(__file__).resolve().parent.parent / "bert-base-chinese"
 MODEL_DIR = Path(os.environ.get("BERT_MODEL_DIR", str(DEFAULT_LOCAL_MODEL_DIR))).expanduser().resolve()
 MAX_LEN = 128
@@ -37,7 +39,8 @@ BATCH_SIZE = 16
 EPOCHS = 3
 LR = 2e-5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR = "./bert_relation_model"
+OUTPUT_DIR = ROOT / "bert_relation_model"
+SPECIAL_TOKENS = {"additional_special_tokens": ["[E1]", "[/E1]", "[E2]", "[/E2]"]}
 
 
 def _validate_local_model_dir(model_dir: Path) -> None:
@@ -68,7 +71,7 @@ def load_data(file_path):
     id2label = {idx: label for label, idx in label2id.items()}
     return samples, label2id, id2label
 
-samples, label2id, id2label = load_data("train.jsonl")
+samples, label2id, id2label = load_data(str(ROOT / "train.jsonl"))
 print("标签映射:", label2id)
 print("正负样本数:", {id2label[k]: sum(1 for _,_,_,l in samples if l==k) for k in label2id})
 
@@ -86,8 +89,8 @@ class RelationDataset(Dataset):
         self.tokenizer = tokenizer
         self.label2id = label2id
         self.max_len = max_len
-        self.inputs = []
-        self.labels = []
+        self.inputs: List[Dict[str, torch.Tensor]] = []
+        self.labels: List[int] = []
         for sent, subj, obj, label in samples:
             text = create_input(sent, subj, obj)
             encoding = tokenizer(
@@ -112,6 +115,9 @@ class RelationDataset(Dataset):
         }
 
 tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True)
+if tokenizer is None:
+    raise RuntimeError(f"无法加载本地 tokenizer: {MODEL_DIR}")
+tokenizer.add_special_tokens(SPECIAL_TOKENS)
 dataset = RelationDataset(samples, tokenizer, label2id, MAX_LEN)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
@@ -121,6 +127,9 @@ model = AutoModelForSequenceClassification.from_pretrained(
     local_files_only=True,
     num_labels=len(label2id)   # 2 类
 )
+if model is None:
+    raise RuntimeError(f"无法加载本地模型: {MODEL_DIR}")
+model.resize_token_embeddings(len(tokenizer))
 model.to(DEVICE)
 
 # ---------- 优化器与调度器 ----------
