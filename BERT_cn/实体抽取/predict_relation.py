@@ -1,54 +1,158 @@
 import json
+import importlib
+import re
+import sys
+from pathlib import Path
+from typing import Any, List, Optional, Tuple, cast
+
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from sentence_transformers import SentenceTransformer, util  # 用于相似度计算
-import re
 
 # ========== 配置 ==========
-MODEL_DIR = "./bert_relation_model"           # 训练好的关系分类器目录
+ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    semantic_module = importlib.import_module("xmodaler.kg.semantic")
+    SemanticScorer = getattr(semantic_module, "SemanticScorer", None)
+except Exception:
+    SemanticScorer = None
+
+MODEL_DIR = ROOT / "bert_relation_model"           # 训练好的关系分类器目录
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SPECIAL_TOKENS = {"additional_special_tokens": ["[E1]", "[/E1]", "[E2]", "[/E2]"]}
 
-# 加载关系分类模型
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-relation_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-relation_model.to(DEVICE)
-relation_model.eval()
+tokenizer_obj: Optional[Any] = None
+relation_model_obj: Optional[Any] = None
 
-# 加载标签映射
-with open(f"{MODEL_DIR}/label_mapping.json", "r", encoding='utf-8') as f:
-    mapping = json.load(f)
-label2id = mapping["label2id"]
-id2label = {int(k): v for k, v in mapping["id2label"].items()}  # 确保 key 为 int
+label2id = {}
+id2label = {}
+
+
+def _load_relation_assets():
+    """按需加载模型与标签映射，避免导入时就失败。"""
+    global tokenizer_obj, relation_model_obj, label2id, id2label
+    if tokenizer_obj is not None and relation_model_obj is not None and id2label:
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True)
+    if tokenizer is None:
+        raise RuntimeError(f"无法加载本地 tokenizer: {MODEL_DIR}")
+    tokenizer = cast(Any, tokenizer)
+    tokenizer.add_special_tokens(SPECIAL_TOKENS)
+
+    relation_model = AutoModelForSequenceClassification.from_pretrained(str(MODEL_DIR), local_files_only=True)
+    if relation_model is None:
+        raise RuntimeError(f"无法加载本地关系模型: {MODEL_DIR}")
+    relation_model = cast(Any, relation_model)
+    relation_model.resize_token_embeddings(len(tokenizer))
+    relation_model.to(DEVICE)
+    relation_model.eval()
+
+    label_map_path = MODEL_DIR / "label_mapping.json"
+    with label_map_path.open("r", encoding="utf-8") as f:
+        mapping = json.load(f)
+
+    tokenizer_obj = tokenizer
+    relation_model_obj = relation_model
+    label2id = mapping.get("label2id", {})
+    id2label = {int(k): v for k, v in mapping.get("id2label", {}).items()}
+    if not id2label:
+        raise RuntimeError(f"标签映射为空: {label_map_path}")
 
 # 加载预定义的思政标签列表（从原始数据中提取，或手动定义）
 # 这里我们从原始数据文件中提取所有不重复的 ideology_labels
 def load_ideology_labels(data_file="computer_ideology_data.txt"):
     labels = set()
-    with open(data_file, 'r', encoding='utf-8') as f:
+    data_path = Path(data_file)
+    if not data_path.is_absolute():
+        data_path = ROOT / data_path
+
+    if not data_path.exists():
+        return []
+
+    with data_path.open('r', encoding='utf-8') as f:
         for line in f:
-            data = json.loads(line.strip())
-            for lab in data["ideology_labels"]:
-                labels.add(lab)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for lab in data.get("ideology_labels", []):
+                if lab:
+                    labels.add(str(lab).strip())
     return sorted(list(labels))
 
 IDEOLOGY_LABELS = load_ideology_labels()
 print(f"已加载 {len(IDEOLOGY_LABELS)} 个思政标签: {IDEOLOGY_LABELS[:5]}...")
 
-# 可选：加载语义相似度模型（用于模糊匹配）
-# 需要安装 sentence-transformers: pip install sentence-transformers
-SIM_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device=DEVICE)
+SEMANTIC_SCORER = None
+scorer_cls = SemanticScorer if callable(SemanticScorer) else None
+if scorer_cls is not None:
+    try:
+        SEMANTIC_SCORER = scorer_cls(
+            model_dir=str(ROOT.parent / "bert-base-chinese"),
+            model_name="bert_cn_base",
+            device_mode="cpu",
+        )
+    except Exception:
+        SEMANTIC_SCORER = None
 
 # ========== 辅助函数 ==========
 def create_input(sentence, subj, obj):
     """与训练时一致的标记方式"""
-    sent_encoded = sentence.replace(subj, "[E1]" + subj + "[/E1]", 1)
-    sent_encoded = sent_encoded.replace(obj, "[E2]" + obj + "[/E2]", 1)
+    sentence = str(sentence or "")
+    subj = str(subj or "").strip()
+    obj = str(obj or "").strip()
+
+    sent_encoded = sentence
+    if subj and subj in sent_encoded:
+        sent_encoded = sent_encoded.replace(subj, "[E1]" + subj + "[/E1]", 1)
+    elif subj:
+        sent_encoded = f"[E1]{subj}[/E1] {sent_encoded}".strip()
+
+    if obj and obj in sent_encoded:
+        sent_encoded = sent_encoded.replace(obj, "[E2]" + obj + "[/E2]", 1)
+    elif obj:
+        sent_encoded = f"{sent_encoded} [E2]{obj}[/E2]".strip()
+
     return sent_encoded
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _similarity_score(left: str, right: str) -> float:
+    if SEMANTIC_SCORER is not None:
+        try:
+            scorer = cast(Any, SEMANTIC_SCORER)
+            return float(scorer.similarity(left, right))
+        except Exception:
+            pass
+    left_c = _compact(left)
+    right_c = _compact(right)
+    if not left_c or not right_c:
+        return 0.0
+    left_set = set(left_c)
+    right_set = set(right_c)
+    return float(len(left_set & right_set) / max(len(left_set | right_set), 1))
 
 def predict_relation(sentence, subject, object_text):
     """返回 (label, confidence)，label 为 '体现' 或 '不体现'"""
+    _load_relation_assets()
+    tok = tokenizer_obj
+    mdl = relation_model_obj
+    if tok is None or mdl is None:
+        raise RuntimeError("关系抽取模型未成功初始化")
+    tok = cast(Any, tok)
+    mdl = cast(Any, mdl)
     text = create_input(sentence, subject, object_text)
-    encoding = tokenizer(
+    encoding = tok(
         text,
         truncation=True,
         padding='max_length',
@@ -58,11 +162,11 @@ def predict_relation(sentence, subject, object_text):
     input_ids = encoding['input_ids'].to(DEVICE)
     attention_mask = encoding['attention_mask'].to(DEVICE)
     with torch.no_grad():
-        logits = relation_model(input_ids, attention_mask=attention_mask).logits
+        logits = mdl(input_ids, attention_mask=attention_mask).logits
         probs = torch.softmax(logits, dim=1)
         pred_id = torch.argmax(probs, dim=1).item()
         confidence = probs[0][pred_id].item()
-    label = id2label[pred_id]   # '体现' 或 '不体现'
+    label = id2label.get(pred_id, "不体现")
     return label, confidence
 
 def extract_candidate_objects(sentence, subject, use_similarity=False, similarity_threshold=0.7):
@@ -71,40 +175,41 @@ def extract_candidate_objects(sentence, subject, use_similarity=False, similarit
     方法1（默认）：直接匹配预定义思政标签在句子中的出现
     方法2（use_similarity=True）：使用语义相似度匹配，对句子中的每个词/短语计算与预定义标签的相似度
     """
-    candidates = []
+    sentence = str(sentence or "")
+    subject = str(subject or "")
+    threshold = min(max(float(similarity_threshold), 0.0), 1.0)
+
+    candidates: List[str] = []
+    normalized_sentence = _compact(sentence)
     if not use_similarity:
         # 简单字符串匹配（精确匹配）
         for label in IDEOLOGY_LABELS:
-            if label in sentence:
+            if label in sentence or _compact(label) in normalized_sentence:
                 # 避免匹配到自身（如果主体也是思政标签？但主体是计算机概念，一般不会冲突）
                 candidates.append(label)
-        # 去重
-        candidates = list(set(candidates))
+        # 去重且保持顺序，保证结果稳定
+        candidates = list(dict.fromkeys(candidates))
     else:
-        # 语义相似度匹配：将句子分词，对每个词（或连续词）与所有思政标签计算相似度
-        # 更高效的方法：用 sentence-transformers 对句子和所有标签编码，然后计算相似度矩阵
-        # 这里简化：只匹配与某个思政标签相似度超过阈值的词（需要预先分词）
-        # 实际生产中可以更精细，比如提取名词短语
-        words = re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', sentence)  # 简单分词
-        # 对每个词，计算与每个标签的相似度
-        word_emb = SIM_MODEL.encode(words, convert_to_tensor=True)
-        label_emb = SIM_MODEL.encode(IDEOLOGY_LABELS, convert_to_tensor=True)
-        similarities = util.cos_sim(word_emb, label_emb)  # (len(words), len(labels))
-        for i, word in enumerate(words):
-            max_sim, max_idx = torch.max(similarities[i], dim=0)
-            if max_sim >= similarity_threshold:
-                matched_label = IDEOLOGY_LABELS[max_idx]
-                # 避免重复添加
-                if matched_label not in candidates:
-                    candidates.append(matched_label)
+        words = re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', sentence)
+        phrases = list(dict.fromkeys(words + [sentence]))
+        for label in IDEOLOGY_LABELS:
+            if label in candidates:
+                continue
+            label_score = max(_similarity_score(sentence, label), _similarity_score(subject, label))
+            phrase_score = max(_similarity_score(item, label) for item in phrases) if phrases else 0.0
+            if max(label_score, phrase_score) >= threshold:
+                candidates.append(label)
     return candidates
 
 def infer_objects(sentence, subject, use_similarity=False, similarity_threshold=0.7):
     """
     主函数：给定句子和主体，返回所有存在 '体现' 关系的客体及其置信度
     """
+    if not str(sentence or "").strip() or not str(subject or "").strip():
+        return []
+
     candidates = extract_candidate_objects(sentence, subject, use_similarity, similarity_threshold)
-    results = []
+    results: List[Tuple[str, float]] = []
     for obj in candidates:
         label, conf = predict_relation(sentence, subject, obj)
         if label == "体现":
