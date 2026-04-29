@@ -3,15 +3,18 @@
 @author: Yehao Li
 @contact: yehaoli.sysu@gmail.com
 """
-import os
+import torch
 
 def decode_sequence(vocab, seq):
+    if not torch.is_tensor(seq):
+        seq = torch.as_tensor(seq)
+    seq = seq.detach().cpu()
     N, T = seq.size()
     sents = []
     for n in range(N):
         words = []
         for t in range(T):
-            ix = seq[n, t]
+            ix = int(seq[n, t].item())
             if ix == 0:
                 break
             words.append(vocab[ix])
