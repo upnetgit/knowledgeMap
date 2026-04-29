@@ -105,7 +105,7 @@ class TDConvEDDecoder(nn.Module):
     def preprocess(self, batched_inputs):
         att_feats = batched_inputs[kfg.ATT_FEATS]
         batch_size, num_frames, hidden_size = att_feats.size()
-        att_masks = batched_inputs[kfg.ATT_MASKS].view(batch_size, num_frames) # [batch, num_frames]
+        att_masks = batched_inputs[kfg.ATT_MASKS].reshape(batch_size, num_frames) # [batch, num_frames]
         ext_att_masks = batched_inputs[kfg.EXT_ATT_MASKS] # 4-D
 
         p_att_feats = self.p_att_feats(att_feats)
@@ -143,10 +143,10 @@ class TDConvEDDecoder(nn.Module):
                                     kfg.EXT_ATT_MASKS:  ext_att_masks.expand(batch_size, seq_len, 1, num_frames)
                                     } )
         '''                            
-        batched_inputs.update( {    kfg.P_ATT_FEATS: p_att_feats.unsqueeze(1).tile(1, seq_len, 1, 1).view(-1, num_frames, self.att_embed_size), 
+            batched_inputs.update( {    kfg.P_ATT_FEATS: p_att_feats.unsqueeze(1).tile(1, seq_len, 1, 1).reshape(-1, num_frames, self.att_embed_size), 
                                     kfg.GLOBAL_FEATS: gv_feat.unsqueeze(1).tile(1, seq_len, 1),
-                                    kfg.ATT_FEATS: att_feats.unsqueeze(1).tile(1, seq_len, 1, 1).view(-1, num_frames, dimension),
-                                    kfg.EXT_ATT_MASKS: ext_att_masks.tile(1, seq_len, 1, 1).view(-1, num_frames)
+                                     kfg.ATT_FEATS: att_feats.unsqueeze(1).tile(1, seq_len, 1, 1).reshape(-1, num_frames, dimension),
+                                     kfg.EXT_ATT_MASKS: ext_att_masks.tile(1, seq_len, 1, 1).reshape(-1, num_frames)
                                     } )
         '''
         return batched_inputs
@@ -189,7 +189,7 @@ class TDConvEDDecoder(nn.Module):
             # input of current time step
             max_seq_len, num_frames, hidden_size = att_feats.size(-3), att_feats.size(-2), att_feats.size(-1)
             cur_global_feats = (global_feats[:, time_step:time_step+1, :]).unsqueeze(1).expand(batch_size, beam_size, 1, hidden_size)
-            cur_global_feats = cur_global_feats.view(-1, 1, hidden_size)
+            cur_global_feats = cur_global_feats.reshape(-1, 1, hidden_size)
             cur_input_embed = torch.cat([wt, cur_global_feats], axis=-1)
             # [batch * beam * time, num_frames, hidden]
             cur_att_feats = (att_feats[:, :time_step+1, :, :]).unsqueeze(1).expand(batch_size, beam_size, time_step+1, num_frames, hidden_size) \
@@ -222,9 +222,9 @@ class TDConvEDDecoder(nn.Module):
         
         # attention
         batch_size = layer_output.size(0)
-        hidden_states = layer_output.view(-1, self.hidden_size) # [batch * beam * time_step, hidden_size]
+        hidden_states = layer_output.reshape(-1, self.hidden_size) # [batch * beam * time_step, hidden_size]
         att_outputs = self.att(hidden_states, cur_att_feats, cur_p_att_feats, cur_att_masks)
-        att_outputs = att_outputs.view(batch_size, -1, self.hidden_size)
+        att_outputs = att_outputs.reshape(batch_size, -1, self.hidden_size)
         layer_output = (layer_output + att_outputs) * math.sqrt(0.5)
         
         if not self.training:
