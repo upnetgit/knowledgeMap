@@ -1265,11 +1265,14 @@ class CaptionGenerator:
             feat_array = np.array(features, dtype=np.float32)  # (50, 2048)
             feat_tensor = torch.from_numpy(feat_array).float().unsqueeze(0)  # (1, 50, 2048)
             att_masks = torch.ones((1, feat_tensor.size(1)), dtype=torch.float32)
+            max_seq_len = int(getattr(getattr(self.xmodaler_config, 'MODEL', None), 'MAX_SEQ_LEN', 20))
+            g_tokens_type = torch.ones((1, max_seq_len), dtype=torch.long)
 
             # xmodaler 的 beam search 入口期望的是单个 batch 字典，而不是 list[dict]
             batched_inputs = {
                 kfg.ATT_FEATS: feat_tensor.to(self.device),
                 kfg.ATT_MASKS: att_masks.to(self.device),
+                kfg.G_TOKENS_TYPE: g_tokens_type.to(self.device),
                 kfg.IDS: ['video'],
             }
 
