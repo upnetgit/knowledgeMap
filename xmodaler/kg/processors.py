@@ -396,6 +396,94 @@ class VideoProcessor:
         except Exception as e:
             logger.error(f"帧提取失败: {str(e)}")
             return []
+
+    @staticmethod
+    def _frame_ocr_score(frame_bgr: np.ndarray) -> float:
+        """为单帧估算 OCR 可读性，优先保留文字密度高、清晰的 PPT/公开课画面。"""
+        if frame_bgr is None or frame_bgr.size == 0:
+            return float("-inf")
+
+        try:
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if max(gray.shape[:2]) > 1280:
+                scale = 1280.0 / float(max(gray.shape[:2]))
+                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+            blur = cv2.GaussianBlur(gray, (3, 3), 0)
+            sharpness = float(cv2.Laplacian(blur, cv2.CV_64F).var())
+            mean_intensity = float(np.mean(blur))
+
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(blur)
+
+            _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            adaptive = cv2.adaptiveThreshold(
+                enhanced,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                11,
+            )
+
+            def _binary_score(binary_img: np.ndarray) -> float:
+                black_ratio = float(np.mean(binary_img == 0))
+                # 文本区域通常占比不高，但也不能太低；公开课 PPT 往往在 8%~25% 之间更可读。
+                density_score = max(0.0, 1.0 - abs(black_ratio - 0.16) / 0.16)
+
+                inv = 255 - binary_img
+                components = 0
+                try:
+                    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
+                    for stat in stats[1:num_labels]:
+                        area = int(stat[cv2.CC_STAT_AREA])
+                        if 12 <= area <= 1800:
+                            components += 1
+                except Exception:
+                    components = 0
+
+                component_score = min(components / 60.0, 1.0)
+                return density_score * 2.0 + component_score * 1.1
+
+            score = max(_binary_score(otsu), _binary_score(adaptive))
+            score += min(sharpness / 350.0, 2.0)
+
+            # 过暗/过亮的页面通常更难识别
+            if mean_intensity < 35 or mean_intensity > 235:
+                score -= 0.8
+
+            return score
+        except Exception:
+            return float("-inf")
+
+    @classmethod
+    def select_ocr_frames(cls, frames: List[np.ndarray], target_count: int = 6) -> List[np.ndarray]:
+        """从候选帧中挑选更适合 OCR 的帧，并尽量保持时间分散。"""
+        if not frames or target_count <= 0:
+            return []
+
+        target_count = min(target_count, len(frames))
+        scored = [(idx, cls._frame_ocr_score(frame)) for idx, frame in enumerate(frames)]
+        scored.sort(key=lambda item: item[1], reverse=True)
+
+        selected_indices: List[int] = []
+        min_gap = max(1, len(frames) // max(target_count * 2, 1))
+
+        for idx, _score in scored:
+            if all(abs(idx - picked) >= min_gap for picked in selected_indices):
+                selected_indices.append(idx)
+            if len(selected_indices) >= target_count:
+                break
+
+        if len(selected_indices) < target_count:
+            for idx, _score in scored:
+                if idx not in selected_indices:
+                    selected_indices.append(idx)
+                if len(selected_indices) >= target_count:
+                    break
+
+        selected_indices = sorted(selected_indices[:target_count])
+        return [frames[idx] for idx in selected_indices]
     
     def extract_video_features(self, video_path: str) -> Optional[List[np.ndarray]]:
         """
@@ -652,9 +740,12 @@ class CaptionGenerator:
             self.xmodaler_load_error = ""
             logger.info(f"已加载 xmodaler 视频字幕模型: {model_key} from {model_path}")
         except ModuleNotFoundError as e:
+            missing_module = getattr(e, "name", "") or str(e)
+            install_hint = "请先安装 transformers（推荐），或安装兼容包 pytorch-transformers 以兼容旧代码。"
             logger.warning(
-                "无法加载 xmodaler 视频字幕模型，缺少依赖: %s。请确认已安装 fvcore/omegaconf/pyyaml 等依赖。",
-                str(e),
+                "无法加载 xmodaler 视频字幕模型，缺少依赖: %s。%s",
+                missing_module,
+                install_hint,
             )
             self.xmodaler_model = None
             self.xmodaler_load_error = str(e)
@@ -1172,13 +1263,15 @@ class CaptionGenerator:
             features = features[:50]
 
             feat_array = np.array(features, dtype=np.float32)  # (50, 2048)
-            feat_tensor = torch.from_numpy(feat_array).float()  # (50, 2048)
+            feat_tensor = torch.from_numpy(feat_array).float().unsqueeze(0)  # (1, 50, 2048)
+            att_masks = torch.ones((1, feat_tensor.size(1)), dtype=torch.float32)
 
-            # xmodaler 期望输入为 List[Dict] 且字段使用 kfg 常量（大写键）
-            batched_inputs = [{
+            # xmodaler 的 beam search 入口期望的是单个 batch 字典，而不是 list[dict]
+            batched_inputs = {
                 kfg.ATT_FEATS: feat_tensor.to(self.device),
-                kfg.IDS: 'video',
-            }]
+                kfg.ATT_MASKS: att_masks.to(self.device),
+                kfg.IDS: ['video'],
+            }
 
             # 推理
             with torch.no_grad():
@@ -1187,6 +1280,8 @@ class CaptionGenerator:
                 output_value = None
                 if isinstance(outputs, dict):
                     output_value = outputs.get(output_key)
+                    if output_value is None:
+                        output_value = outputs.get(kfg.G_SENTS_IDS)
                     if output_value is None:
                         output_value = outputs.get('output')
 
@@ -1221,13 +1316,14 @@ class CaptionGenerator:
 
             # 抽样帧做 OCR
             if self.use_ocr:
-                sample_indices = np.linspace(0, len(frames) - 1, min(len(frames), 6), dtype=int)
+                ocr_frames = VideoProcessor.select_ocr_frames(frames, target_count=min(len(frames), 8))
+                logger.info(f"视频OCR选帧: {len(ocr_frames)}/{len(frames)} 帧")
                 ocr_texts = []
-                for idx in sample_indices:
+                for frame in ocr_frames:
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as frame_file:
                         frame_path = frame_file.name
                     try:
-                        cv2.imwrite(frame_path, frames[int(idx)])
+                        cv2.imwrite(frame_path, frame)
                         text = self.recognize_text_from_image(frame_path)
                         if text:
                             ocr_texts.append(text)
@@ -1296,7 +1392,7 @@ class CaptionGenerator:
 
             # 方案 B：回退到 BLIP+OCR+ASR
             logger.info("xmodaler 不可用或生成失败，改用 BLIP+OCR+ASR")
-            video_processor = VideoProcessor()
+            video_processor = VideoProcessor(frames_per_video=24, device_mode=self.device_mode)
             frames = video_processor.extract_frames(video_path)
 
             if not frames:
@@ -1309,19 +1405,18 @@ class CaptionGenerator:
             cv2.imwrite(temp_path, frames[middle_frame_idx])
 
             ocr_texts: List[str] = []
-            # 优化策略：增加OCR采样帧数（教学视频通常较长，需要更全面的文字覆盖）
-            sample_count = min(len(frames), 10)  # 增加到10帧（从6帧）
-            sample_indices = np.linspace(0, len(frames) - 1, sample_count, dtype=int)
+            # 公开课/PPT 场景：优先从整段视频中筛选文字密度更高的帧，再做 OCR
+            ocr_frames = VideoProcessor.select_ocr_frames(frames, target_count=min(len(frames), 10))
 
             try:
                 blip_caption = self.generate_image_caption(temp_path)
                 if self.use_ocr:
-                    logger.info(f"视频OCR采样: {sample_count}帧")
-                    for idx in sample_indices:
+                    logger.info(f"视频OCR选帧: {len(ocr_frames)}/{len(frames)} 帧")
+                    for frame in ocr_frames:
                         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as frame_file:
                             frame_path = frame_file.name
                         try:
-                            cv2.imwrite(frame_path, frames[int(idx)])
+                            cv2.imwrite(frame_path, frame)
                             text = self.recognize_text_from_image(frame_path)
                             if text:
                                 ocr_texts.append(text)
