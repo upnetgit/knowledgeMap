@@ -718,10 +718,37 @@ class CaptionGenerator:
             tmp_cfg = cfg.load_from_file_tmp(str(config_path))
             add_config(cfg, tmp_cfg)
             cfg.merge_from_file(str(config_path))
-            # 推理场景下强制使用仓库内词表，避免训练配置中的相对路径漂移。
-            vocab_path = project_root / "configs" / "video_captioning" / "vocabulary.txt"
-            if vocab_path.exists():
-                cfg.INFERENCE.VOCAB = str(vocab_path)
+            # 推理场景下优先使用与模型权重匹配的词表。
+            # 对于 msrvtt_tdconved（预训练权重来自 MSR-VTT），必须优先使用 repository 中的 msrvtt_dataset 词表（7001 words）。
+            # 这样能确保 token embedding / predictor 与 checkpoint 形状对齐，避免加载成 2075 词表。
+            vocab_candidates = []
+            if model_key == "msrvtt_tdconved":
+                vocab_candidates.append(project_root / "xmodaler" / "datasets" / "msrvtt_dataset" / "vocabulary.txt")
+            vocab_candidates.extend([
+                project_root / "data" / "annotations" / "vocabulary.txt",
+                project_root / "configs" / "video_captioning" / "vocabulary.txt",
+            ])
+
+            selected_vocab = None
+            for vocab_path in vocab_candidates:
+                if vocab_path.exists():
+                    selected_vocab = vocab_path
+                    break
+
+            if selected_vocab is not None:
+                cfg.INFERENCE.VOCAB = str(selected_vocab)
+                # 直接按选定词表长度设置模型词表大小，避免默认值 2075 覆盖。
+                try:
+                    vocab_list = self._load_vocab_file(str(selected_vocab))
+                    if vocab_list is not None:
+                        cfg.MODEL.VOCAB_SIZE = len(vocab_list)
+                        logger.info(
+                            "xmodaler 视频字幕使用词表: %s (VOCAB_SIZE=%s)",
+                            selected_vocab,
+                            cfg.MODEL.VOCAB_SIZE,
+                        )
+                except Exception as e:
+                    logger.warning("读取词表失败，保留原始 VOCAB_SIZE=%s: %s", cfg.MODEL.VOCAB_SIZE, e)
             # 与当前运行设备保持一致，避免 CPU 环境被默认 CUDA 配置拉起
             cfg.MODEL.DEVICE = str(device)
             cfg.MODEL.WEIGHTS = str(model_path)
@@ -763,10 +790,9 @@ class CaptionGenerator:
             return None
         vocab = ['.']
         try:
+            # 与 xmodaler.functional.load_vocab 保持一致：保留空行占位，避免词表长度少 1。
             for line in path.read_text(encoding='utf-8', errors='ignore').splitlines():
-                token = line.strip()
-                if token:
-                    vocab.append(token)
+                vocab.append(line.strip())
             return vocab
         except Exception:
             return None
@@ -1104,6 +1130,29 @@ class CaptionGenerator:
         if ascii_alpha_count >= 24 and token_count >= 8 and short_ascii_tokens / max(token_count, 1) >= 0.45:
             return True
         return False
+
+    @staticmethod
+    def _is_useful_video_ocr(text: Optional[str]) -> bool:
+        """判断视频 OCR 是否值得拼接到最终字幕中，避免长串噪声污染结果。"""
+        normalized = normalize_zh_text(text or "")
+        if not normalized:
+            return False
+
+        zh_count = sum(1 for ch in normalized if '\u4e00' <= ch <= '\u9fff')
+        ascii_alpha_count = sum(1 for ch in normalized if ch.isascii() and ch.isalpha())
+        digit_count = sum(1 for ch in normalized if ch.isdigit())
+        total_len = max(len(normalized), 1)
+
+        # 至少要有一些中文主体；如果几乎全是英文/数字碎片，则不要拼接到最终字幕。
+        if zh_count < 4 and ascii_alpha_count > 12:
+            return False
+        # 太长且中文很少，通常是终端/代码页/网页内容噪声。
+        if total_len > 120 and zh_count < 12:
+            return False
+        # 中文占比太低，也认为不值得拼接。
+        if zh_count / total_len < 0.12 and digit_count > 10:
+            return False
+        return True
 
     @staticmethod
     def _is_blip_caption_low_quality(caption: str) -> bool:
@@ -1498,7 +1547,7 @@ class CaptionGenerator:
         parts: List[str] = []
 
         # 步骤 1：OCR 文字作为主体信息（教学课件可视化内容）
-        if ocr_text and len(ocr_text.strip()) >= 10:
+        if ocr_text and len(ocr_text.strip()) >= 10 and self._is_useful_video_ocr(ocr_text):
             parts.append(f"教学课件：{ocr_text}")
 
         # 步骤 2：ASR 讲解内容作为补充（教学讲解语音）
