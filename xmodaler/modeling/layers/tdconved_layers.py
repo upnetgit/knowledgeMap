@@ -46,7 +46,7 @@ class TemporalDeformableBlock(nn.Module):
                                         kernel_size,
                                         stride,
                                         kernel_size // 2 # with padding
-                                    )).cuda()
+                                    ))
         else:
             self.offset_conv = nn.Conv1d(
                                         in_channels,
@@ -54,7 +54,7 @@ class TemporalDeformableBlock(nn.Module):
                                         kernel_size,
                                         stride,
                                         kernel_size // 2 # with padding
-                                    ).cuda()
+                                    )
 
         self.offset_act = get_act_layer(offset_act)() if offset_act.lower() != "none" else None
 
@@ -66,7 +66,7 @@ class TemporalDeformableBlock(nn.Module):
                                 kernel_size,
                                 stride,
                                 0 # without padding
-                            )).cuda()
+                            ))
         else:
             self.conv = nn.Conv1d(
                                 in_channels,
@@ -74,7 +74,7 @@ class TemporalDeformableBlock(nn.Module):
                                 kernel_size,
                                 stride,
                                 0 # without padding
-                            ).cuda() 
+                            )
         # zero initialization
         self._init_offset_param()
 
@@ -92,9 +92,9 @@ class TemporalDeformableBlock(nn.Module):
         offests = self.offset_conv(padded_inputs) # [batch, kernel_size, TIME_STEP]
         if self.offset_act is not None:
             offests = self.offset_act(offests)
-        offests_pred = offests.permute(0, 2, 1).cpu() # [batch, TIME_STEP, kernel_size]
+        offests_pred = offests.permute(0, 2, 1) # [batch, TIME_STEP, kernel_size]
 
-        sampling_positions = self._get_sampling_shift() # [kernel_size]
+        sampling_positions = self._get_sampling_shift(device=inputs.device, dtype=inputs.dtype) # [kernel_size]
 
         # [batch, 1, max_len, dim]
         new_inputs = inputs.permute(0, 2, 1).unsqueeze(1) # [b, 1, TIME_STEP, ENCODER_HIDDEN_DIM]
@@ -105,28 +105,34 @@ class TemporalDeformableBlock(nn.Module):
         for sample_idx, pos in enumerate(sampling_positions):
             # same sampling choice along time, each pos will have the same shift like -1 in [-1, 0, 1] for k =3
             # [batch, H, 1]
-            cur_pos_offset = torch.Tensor([pos * single_step_offset])\
-                                                .unsqueeze(0).repeat(H, 1)\
-                                                .unsqueeze(0).repeat(batch_size, 1, 1)
+            cur_pos_offset = (pos * single_step_offset).view(1, 1, 1).repeat(batch_size, H, 1)
             # the predicted offsets for the first sampling pos
             cur_pred_offset = offests_pred[:, :, sample_idx:sample_idx+1] 
             new_offset = cur_pos_offset + cur_pred_offset
-            grid = self._make_grid(H, W, new_offset, batch_size) # temporal shift 1 step left, [b, h, w, 2]
+            grid = self._make_grid(
+                H,
+                W,
+                new_offset,
+                batch_size,
+                device=inputs.device,
+                dtype=inputs.dtype,
+            ) # temporal shift 1 step left, [b, h, w, 2]
 
             # [batch_size, 1, H, W]
             sampled_feat = F.grid_sample(   new_inputs, 
                                             grid, 
                                             mode="bilinear", 
-                                            padding_mode=self.padding_mode
+                                            padding_mode=self.padding_mode,
+                                            align_corners=True
                                         )
 
-            sampled_feats.append(sampled_feat.squeeze())
-        
+            sampled_feats.append(sampled_feat.squeeze(1))
+
         # [batch_size * H, W, kernel_size]
-        sampled_feats = torch.stack(sampled_feats, dim=-1).view(-1, W, self.kernel_size)
+        sampled_feats = torch.stack(sampled_feats, dim=-1).reshape(-1, W, self.kernel_size)
 
         # [b, h, 2 * w, k] -> [b * h, 2 * w, k] -> [b, h, 2 * w]
-        outputs = self.conv(sampled_feats).view(batch_size, H, -1)
+        outputs = self.conv(sampled_feats).reshape(batch_size, H, -1)
         # if self.padding_mode == "null":
         #    outputs = outputs[:, self.half_span:-self.half_span, :]
         #    assert outpus.size(1) == max_len - 2 * self.half_span
@@ -138,8 +144,8 @@ class TemporalDeformableBlock(nn.Module):
             right_most_feat = inputs[:, :, -1:].repeat(1, 1, self.half_span)
         elif self.padding_mode == "zeros" or self.padding_mode == "null":
             batch_size, W, H = inputs.size()
-            left_most_feat = torch.zeros((batch_size, W, self.half_span)).float().cuda()
-            right_most_feat = torch.zeros((batch_size, W, self.half_span)).float().cuda()
+            left_most_feat = torch.zeros((batch_size, W, self.half_span), dtype=torch.float32, device=inputs.device)
+            right_most_feat = torch.zeros((batch_size, W, self.half_span), dtype=torch.float32, device=inputs.device)
         else:
             raise NotImplementedError("not supported padding type")
 
@@ -151,9 +157,15 @@ class TemporalDeformableBlock(nn.Module):
 
         return outputs
 
-    def _get_sampling_shift(self):
+    def _get_sampling_shift(self, device=None, dtype=torch.float32):
         # [-k//2, -k//2+1, ..., k//2]
-        positions = torch.Tensor(torch.arange(-self.half_span, self.half_span+1, self.dilation).float())
+        positions = torch.arange(
+            -self.half_span,
+            self.half_span + 1,
+            self.dilation,
+            dtype=dtype,
+            device=device,
+        )
         assert len(positions) == self.kernel_size
         return positions
 
@@ -161,7 +173,7 @@ class TemporalDeformableBlock(nn.Module):
         # normalize the idx to [-1, 1]
         return idx * 2.0 / (H - 1)
 
-    def _make_grid(self, H, W, dH = 0., batch_size=0):
+    def _make_grid(self, H, W, dH = 0., batch_size=0, device=None, dtype=torch.float32):
         '''
         dH -  offset relative to the ordinate idx, [b, h, w], elem value in [-1, 1]
         make grid for linear interpolation along H dimension
@@ -173,9 +185,9 @@ class TemporalDeformableBlock(nn.Module):
         '''
         if isinstance(dH, float) or isinstance(dH, int): 
             # scaler shift, same shift along the H dimension
-            h_grid = torch.arange(H).unsqueeze(1).repeat(1, W).unsqueeze(-1).float() 
+            h_grid = torch.arange(H, device=device, dtype=dtype).unsqueeze(1).repeat(1, W).unsqueeze(-1)
             h_grid = h_grid.unsqueeze(0) / (H - 1) * 2.0 - 1.0 + dH
-            w_grid = torch.arange(W).unsqueeze(0).repeat(H, 1).unsqueeze(-1).float()
+            w_grid = torch.arange(W, device=device, dtype=dtype).unsqueeze(0).repeat(H, 1).unsqueeze(-1)
             w_grid = w_grid.unsqueeze(0) / (W - 1) * 2.0 - 1.0
 
             if batch_size > 0:
@@ -183,19 +195,22 @@ class TemporalDeformableBlock(nn.Module):
                 w_grid = w_grid.repeat(batch_size, 1, 1, 1)
 
         elif isinstance(dH, torch.Tensor) and len(dH.size()) == 3: # [b, h, w]
+            if device is None:
+                device = dH.device
+            dH = dH.to(device=device, dtype=dtype)
             # [h, w, 1]
-            h_grid = torch.arange(H).unsqueeze(1).repeat(1, W).unsqueeze(-1).float()
+            h_grid = torch.arange(H, device=device, dtype=dtype).unsqueeze(1).repeat(1, W).unsqueeze(-1)
             h_grid = h_grid.unsqueeze(0).repeat(batch_size, 1, 1, 1) / (H - 1) * 2.0 - 1.0
             h_grid += dH.unsqueeze(-1)
             h_grid = torch.clamp(h_grid, -1.0, 1.0)
 
-            w_grid = torch.arange(W).unsqueeze(0).repeat(H, 1).unsqueeze(-1).float()
+            w_grid = torch.arange(W, device=device, dtype=dtype).unsqueeze(0).repeat(H, 1).unsqueeze(-1)
             w_grid = w_grid.unsqueeze(0).repeat(batch_size, 1, 1, 1) / (W - 1) * 2.0 - 1.0
         else:
             raise NotImplementedError("offsets size not supported")
 
-        grid = torch.cat((w_grid, h_grid), dim=-1).cuda()
-        return grid 
+        grid = torch.cat((w_grid, h_grid), dim=-1)
+        return grid
 
 class TemporalDeformableLayer(nn.Module):
     def __init__(
@@ -264,7 +279,7 @@ class ShiftedConvLayer(nn.Module):
                                     stride,
                                     self.kernel_size-1,
                                     padding_mode=padding_mode
-                                )).cuda()   
+                                ))
         else:
             self.conv =  nn.Conv1d(
                                     in_channels,
@@ -273,7 +288,7 @@ class ShiftedConvLayer(nn.Module):
                                     stride,
                                     self.kernel_size-1,
                                     padding_mode=padding_mode
-                                ).cuda()
+                                )
         self.act = nn.GLU()
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None 
         
