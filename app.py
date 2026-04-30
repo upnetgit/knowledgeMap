@@ -1558,7 +1558,7 @@ def annotation_save():
     with _annotation_file().open('a', encoding='utf-8') as f:
         f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
-    #保存 JSONL + 可选即时同步 Neo4j（默认）
+    # C 方案：保存 JSONL + 可选即时同步 Neo4j（默认开启）
     sync_to_neo4j = str(payload.get('sync_to_neo4j', 'true')).strip().lower() not in {'0', 'false', 'no', 'off'}
     sync_status = 'skipped'
     if sync_to_neo4j:
@@ -2297,6 +2297,26 @@ def ingest_text():
 
 @app.route('/video/<path:filename>')
 def serve_video(filename):
+    """
+    Serve a video clip. Primary location is data/clips (generated short clips),
+    but fall back to other media folders if the clip doesn't exist. This makes
+    the `/video/<filename>` route tolerant when clips have not been created and
+    the original video lives in `data/video` or `data/video_fixed`.
+    """
+    data_root = os.path.join(app.root_path, 'data')
+    # candidate subdirectories in priority order
+    candidates = ['clips', 'video', 'video_fixed', os.path.join('uploads', 'video')]
+    for sub in candidates:
+        video_dir = os.path.join(data_root, sub)
+        candidate_path = os.path.join(video_dir, filename)
+        try:
+            if os.path.exists(candidate_path) and os.path.isfile(candidate_path):
+                return send_from_directory(video_dir, filename)
+        except Exception:
+            # ignore and try next
+            continue
+    # not found in fallbacks -> return 404 via send_from_directory on clips (will raise)
+    # keep original behavior if nothing matched
     video_dir = os.path.join(app.root_path, 'data', 'clips')
     return send_from_directory(video_dir, filename)
 
