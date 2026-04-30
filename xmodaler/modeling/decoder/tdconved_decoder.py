@@ -133,7 +133,9 @@ class TDConvEDDecoder(nn.Module):
                                     } )
         else:
             self._init_decoding_buffer(batch_size)
-            wt = batched_inputs[kfg.G_TOKENS_TYPE] # [batch, max_len]
+            wt = batched_inputs.get(kfg.G_TOKENS_IDS, batched_inputs.get(kfg.G_TOKENS_TYPE))  # [batch, max_len]
+            if wt is None:
+                raise KeyError("TDConvEDDecoder preprocess needs G_TOKENS_IDS or G_TOKENS_TYPE in inference mode")
             seq_len = wt.size(1)
             # expand along time
             batched_inputs.update( {    
