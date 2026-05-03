@@ -523,7 +523,7 @@ class Neo4jQuery:
                         ORDER BY size(name) ASC
                         LIMIT 20
                         """,
-                        query=compact,
+                        {"query": compact},
                     )
                     for record in result:
                         name = _safe_text(record.get('name'))
@@ -566,7 +566,7 @@ class Neo4jQuery:
                     ORDER BY score DESC, size(name) ASC
                     LIMIT 8
                     """,
-                    query=compact,
+                    {"query": compact},
                 )
                 candidates = [record['name'] for record in result if record.get('name')]
 
