@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-from .builder import KGBuilder
-from .processors import (
+from .builder import (
+    KGBuilder,
     TextProcessor,
     ImageProcessor,
     VideoProcessor,
-    CaptionGenerator
+    CaptionGenerator,
 )
 from .semantic import SemanticScorer, RelationReranker, summarize_text
 
