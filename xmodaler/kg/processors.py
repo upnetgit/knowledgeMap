@@ -15,6 +15,7 @@ import cv2
 import logging
 import tempfile
 import subprocess
+import threading
 from typing import List, Dict, Tuple, Optional, Any
 import numpy as np
 from pathlib import Path
@@ -466,10 +467,25 @@ class VideoProcessor:
         scored = [(idx, cls._frame_ocr_score(frame)) for idx, frame in enumerate(frames)]
         scored.sort(key=lambda item: item[1], reverse=True)
 
+        # 先做时间分桶，确保整段视频有覆盖。
+        bucket_count = min(target_count, max(3, len(frames) // 4))
+        boundaries = np.linspace(0, len(frames), num=bucket_count + 1, dtype=int)
         selected_indices: List[int] = []
-        min_gap = max(1, len(frames) // max(target_count * 2, 1))
 
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            window = [item for item in scored if start <= item[0] < end]
+            if not window:
+                continue
+            center = (start + end - 1) / 2.0
+            best_idx, _ = max(window, key=lambda item: (item[1], -abs(item[0] - center)))
+            if best_idx not in selected_indices:
+                selected_indices.append(best_idx)
+
+        # 再用全局高分帧补齐，并保持一定间隔，尽量避免抽到相邻页面。
+        min_gap = max(1, len(frames) // max(target_count * 2, 1))
         for idx, _score in scored:
+            if idx in selected_indices:
+                continue
             if all(abs(idx - picked) >= min_gap for picked in selected_indices):
                 selected_indices.append(idx)
             if len(selected_indices) >= target_count:
@@ -578,6 +594,7 @@ class CaptionGenerator:
         asr_model_size: str = "small",
         use_xmodaler_video: bool = True,
         xmodaler_model_type: str = "tdconved",
+        use_tden_retrieval: bool = False,
         device_mode: str = "auto",
     ):
         """
@@ -591,6 +608,7 @@ class CaptionGenerator:
             asr_model_size: faster-whisper 模型尺寸（tiny/base/small/medium/large）
             use_xmodaler_video: 是否使用 xmodaler 专业视频字幕模型（默认开启，优先于BLIP）
             xmodaler_model_type: xmodaler 模型类型（tdconved/ta，默认 tdconved）
+            use_tden_retrieval: 是否加载 TDEN 检索模型（默认关闭；当前主流程未直接使用）
         """
         self.model_name = model_name
         self.use_ocr = use_ocr
@@ -599,6 +617,7 @@ class CaptionGenerator:
         self.asr_model_size = asr_model_size
         self.use_xmodaler_video = use_xmodaler_video
         self.xmodaler_model_type = str(xmodaler_model_type or "tdconved").strip().lower()
+        self.use_tden_retrieval = bool(use_tden_retrieval)
         self.device_mode = str(device_mode or "auto").strip().lower()
         self.model = None
         self.processor = None
@@ -613,6 +632,8 @@ class CaptionGenerator:
         self.tden_image_config = None
         self.tden_retrieval_model = None
         self.tden_retrieval_config = None
+        self.video_processor = None
+        self._video_processor_lock = threading.Lock()
         self.device = None
         self.xmodaler_load_error = ""
         self._load_model()
@@ -623,7 +644,8 @@ class CaptionGenerator:
         if self.use_xmodaler_video:
             self._load_xmodaler_video_model()
         self._load_tden_image_caption_model()
-        self._load_tden_retrieval_model()
+        if self.use_tden_retrieval:
+            self._load_tden_retrieval_model()
 
     def _load_model(self):
         """加载预训练的图像描述模型"""
@@ -796,6 +818,13 @@ class CaptionGenerator:
             return vocab
         except Exception:
             return None
+
+    def _get_video_processor(self) -> VideoProcessor:
+        if self.video_processor is None:
+            with self._video_processor_lock:
+                if self.video_processor is None:
+                    self.video_processor = VideoProcessor(frames_per_video=50, device_mode=self.device_mode)
+        return self.video_processor
 
     def _load_tden_image_caption_model(self):
         """加载 TDEN 图像字幕模型（替代 BLIP）。"""
@@ -1092,18 +1121,38 @@ class CaptionGenerator:
         digit_count = sum(1 for ch in normalized if ch.isdigit())
         ascii_alpha_count = sum(1 for ch in normalized if ch.isascii() and ch.isalpha())
         punctuation_count = sum(1 for ch in normalized if ch in '，。！？；：（）')
+        tokens = [token for token in normalized.split(" ") if token]
+        short_ascii_tokens = [token for token in tokens if token.isascii() and token.isalpha() and len(token) <= 3]
+        long_ascii_tokens = [token for token in tokens if token.isascii() and token.isalpha() and len(token) >= 5]
+
+        chinese_ratio = zh_count / total_len
+        ascii_ratio = ascii_alpha_count / total_len
 
         # 计分策略：
         # - 中文字符权重最高（3.0）：教学课件主要信息
         # - 数字和标点符号有益（教学内容常含数字）
         # - 纯ASCII碎片词为噪声，大幅降权
-        score = (zh_count * 3.5)  # 中文为主体
-        score += (digit_count * 0.2)  # 数字有用
-        score += (punctuation_count * 0.15)  # 标点符号指示段落结构
-        score += (min(total_len, 200) * 0.02)  # 长度奖励（但不过度）
+        score = (zh_count * 4.0)
+        score += (digit_count * 0.18)
+        score += (punctuation_count * 0.16)
+        score += (min(total_len, 240) * 0.02)
+
+        if zh_count >= 4:
+            score += min(chinese_ratio * 12.0, 8.0)
+
+        if zh_count > 0 and ascii_alpha_count > 0:
+            score += min(zh_count, 10) * 0.3
 
         # 惩罚纯ASCII垃圾
-        score -= ascii_alpha_count * 0.15
+        score -= ascii_alpha_count * 0.18
+        score -= len(short_ascii_tokens) * 0.7
+        score -= len(long_ascii_tokens) * 0.25
+
+        # 英文/数字占比过高时，进一步降权。
+        if zh_count == 0 and ascii_alpha_count >= 8:
+            score -= 12.0
+        elif chinese_ratio < 0.08 and (ascii_ratio > 0.30 or digit_count > 8):
+            score -= 5.0
 
         # 若几乎全是ASCII字母（乱码特征），大幅降低
         if zh_count == 0 and ascii_alpha_count > 20:
@@ -1116,18 +1165,32 @@ class CaptionGenerator:
         if not normalized:
             return True
 
-        if self._contains_chinese(normalized):
+        zh_count = sum(1 for ch in normalized if '\u4e00' <= ch <= '\u9fff')
+        total_len = max(len(normalized), 1)
+        chinese_ratio = zh_count / total_len
+        if zh_count >= 4 and chinese_ratio >= 0.08:
             return False
 
         ascii_alpha_count = sum(1 for ch in normalized if ch.isascii() and ch.isalpha())
-        token_count = len([token for token in normalized.split(" ") if token])
+        token_list = [token for token in normalized.split(" ") if token]
+        token_count = len(token_list)
         short_ascii_tokens = len([
             token for token in normalized.split(" ")
             if token.isascii() and token.isalpha() and len(token) <= 3
         ])
+        digit_count = sum(1 for ch in normalized if ch.isdigit())
+        symbol_count = sum(1 for ch in normalized if ch in "<>{}[]()=+-*/\\|_~`^@#$%^&")
 
         # 典型乱码特征：大量短英文碎片词，且不含中文。
-        if ascii_alpha_count >= 24 and token_count >= 8 and short_ascii_tokens / max(token_count, 1) >= 0.45:
+        if ascii_alpha_count >= 20 and token_count >= 6 and short_ascii_tokens / max(token_count, 1) >= 0.45:
+            return True
+
+        # 终端/代码页/网页控件片段，通常缺少中文且符号占比很高。
+        if zh_count < 2 and (ascii_alpha_count + digit_count) >= 18 and symbol_count >= 4:
+            return True
+
+        # 英文主导且短 token 很多，通常是噪声而不是可读字幕。
+        if zh_count < 2 and ascii_alpha_count >= 12 and token_count >= 5 and short_ascii_tokens >= 3:
             return True
         return False
 
@@ -1290,8 +1353,8 @@ class CaptionGenerator:
             from xmodaler.functional import decode_sequence
             from xmodaler.config import kfg
 
-            # 从视频抽取特征（ResNet152，与 xmodaler 配套）
-            video_processor = VideoProcessor(frames_per_video=50)  # xmodaler 标准是 50 帧
+            # 从视频抽取特征（按需创建并复用，避免重复初始化图像主干）
+            video_processor = self._get_video_processor()
             frames = video_processor.extract_frames(video_path)
             if not frames:
                 return None
@@ -1389,17 +1452,6 @@ class CaptionGenerator:
             if self.use_asr:
                 asr_text = self.transcribe_video_audio(video_path)
 
-            # BLIP 备选
-            if self.model and self.processor:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-                    temp_path = tmp_file.name
-                middle_frame_idx = len(frames) // 2
-                cv2.imwrite(temp_path, frames[middle_frame_idx])
-                try:
-                    blip_fallback = self.generate_image_caption(temp_path)
-                finally:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
 
             return {
                 'xmodaler_caption': xmodaler_caption,
@@ -1426,25 +1478,30 @@ class CaptionGenerator:
             if self.use_xmodaler_video and self.xmodaler_model:
                 result = self.generate_video_caption_xmodaler(video_path)
                 if result and result.get('xmodaler_caption'):
-                    xmodaler_caption = result['xmodaler_caption']
-                    ocr_text = result.get('ocr_text')
-                    asr_text = result.get('asr_text')
-
-                    # 融合：xmodaler + OCR + ASR
-                    parts = [xmodaler_caption]
-                    if ocr_text:
-                        parts.append(f"[文字: {ocr_text}]")
-                    if asr_text:
-                        parts.append(f"[讲解: {asr_text}]")
-                    caption = normalize_zh_text(' '.join(parts))
-                    logger.info(f"使用 xmodaler 生成视频描述: {caption[:100]}...")
-                    return caption
+                    caption = self._compose_video_caption_parts(
+                        result.get('ocr_text'),
+                        result.get('asr_text'),
+                        result['xmodaler_caption'],
+                        fallback_visual_label="视觉补充",
+                    )
+                    if caption:
+                        video_processor = self._get_video_processor()
+                        video_meta = video_processor.get_video_metadata(video_path)
+                        meta_hint = []
+                        if video_meta.get('fps'):
+                            meta_hint.append(f"{video_meta['fps']:.1f}fps")
+                        if video_meta.get('frame_count'):
+                            meta_hint.append(f"{video_meta['frame_count']}帧")
+                        if meta_hint:
+                            caption = f"{caption} | {' '.join(meta_hint)}"
+                        logger.info(f"使用 xmodaler 生成视频描述: {caption[:100]}...")
+                        return caption
             elif self.use_xmodaler_video and not self.xmodaler_model:
                 logger.warning(f"xmodaler 模型未加载，原因: {self.xmodaler_load_error or 'unknown'}")
 
             # 方案 B：回退到 BLIP+OCR+ASR
             logger.info("xmodaler 不可用或生成失败，改用 BLIP+OCR+ASR")
-            video_processor = VideoProcessor(frames_per_video=24, device_mode=self.device_mode)
+            video_processor = self._get_video_processor()
             frames = video_processor.extract_frames(video_path)
 
             if not frames:
@@ -1488,7 +1545,7 @@ class CaptionGenerator:
                         meta_hint.append(f"{video_meta['frame_count']}帧")
                     if meta_hint:
                         caption = f"{caption} | {' '.join(meta_hint)}"
-                return normalize_zh_text(caption)
+                return normalize_zh_text(caption) or None
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -1515,13 +1572,62 @@ class CaptionGenerator:
 
         counter = Counter(cleaned)
         # 基于频率和长度排序，优先选择稳定且完整的文本
-        ranked = sorted(counter.items(), key=lambda item: (-item[1], -len(item[0])))
-        
-        # 返回最高频的文本（而不是拼接），避免重复
-        best_text = ranked[0][0] if ranked else None
-        
+        ranked = sorted(
+            counter.items(),
+            key=lambda item: (-item[1], -sum(1 for ch in item[0] if '\u4e00' <= ch <= '\u9fff'), -len(item[0]))
+        )
+
+        selected: List[str] = []
+        for candidate, _count in ranked:
+            if any(candidate == item or candidate in item or item in candidate for item in selected):
+                continue
+            selected.append(candidate)
+            if len(selected) >= 2:
+                break
+
+        if not selected:
+            return None
+
+        # 优先保留更完整的主体文本；若存在第二段明显不同且可读的文本，则轻量拼接。
+        best_text = selected[0]
+        if len(selected) >= 2:
+            merged = f"{selected[0]}；{selected[1]}"
+            if len(merged) <= 140:
+                best_text = merged
+
         logger.info(f"聚合 {len(texts)} 帧OCR结果，{len(cleaned)} 个有效，最优: {best_text[:100] if best_text else 'None'}...")
         return normalize_zh_text(best_text) if best_text else None
+
+    def _compose_video_caption_parts(
+        self,
+        ocr_text: Optional[str],
+        asr_text: Optional[str],
+        visual_text: Optional[str],
+        *,
+        fallback_visual_label: str = "视觉补充",
+    ) -> Optional[str]:
+        """将视频多模态结果统一拼成中文教学场景的三段式描述。"""
+        parts: List[str] = []
+
+        if ocr_text and len(ocr_text.strip()) >= 10 and self._is_useful_video_ocr(ocr_text):
+            parts.append(f"课件：{normalize_zh_text(ocr_text)}")
+
+        if asr_text and len(asr_text.strip()) >= 15:
+            parts.append(f"讲解：{normalize_zh_text(asr_text[:200])}")
+
+        visual_text = normalize_zh_text(visual_text) if visual_text else ""
+        if visual_text:
+            if not parts:
+                parts.append(f"图像描述：{visual_text}")
+            elif self._contains_chinese(visual_text):
+                parts.append(f"{fallback_visual_label}：{visual_text}")
+            else:
+                parts.append(f"视觉参考：{visual_text}")
+
+        if not parts:
+            return None
+
+        return normalize_zh_text(' | '.join(parts))
 
     def _fusion_captions(self,
                          blip_caption: Optional[str],
@@ -1543,30 +1649,14 @@ class CaptionGenerator:
         if not blip_caption and not ocr_text and not asr_text:
             return None
 
-        # A方案：多模态智能融合
-        parts: List[str] = []
-
-        # 步骤 1：OCR 文字作为主体信息（教学课件可视化内容）
-        if ocr_text and len(ocr_text.strip()) >= 10 and self._is_useful_video_ocr(ocr_text):
-            parts.append(f"教学课件：{ocr_text}")
-
-        # 步骤 2：ASR 讲解内容作为补充（教学讲解语音）
-        if asr_text and len(asr_text.strip()) >= 15:
-            parts.append(f"讲解：{asr_text[:200]}")  # 限制ASR长度，避免过冗长
-
-        # 步骤 3：BLIP描述作为备选，但仅在无OCR或ASR时使用
-        if blip_caption and not ocr_text and not asr_text:
-            # 只有在没有中文信息时才用BLIP英文描述
-            parts.append(f"图像描述：{blip_caption}")
-        elif blip_caption and not ocr_text:
-            # OCR 失败但有 ASR，BLIP 可作补充
-            parts.append(f"图像参考：{blip_caption}")
-
-        if not parts:
-            # 所有源都缺失或质量低
+        result = self._compose_video_caption_parts(
+            ocr_text,
+            asr_text,
+            blip_caption,
+            fallback_visual_label="视觉补充",
+        )
+        if not result:
             return None
-
-        result = normalize_zh_text(' | '.join(parts))
         logger.info(f"融合多模态描述: {result[:120]}...")
         return result
 
