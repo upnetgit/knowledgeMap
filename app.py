@@ -122,7 +122,8 @@ def _sanitize_upload_filename(filename: str) -> str:
     if secure_filename:
         cleaned = secure_filename(cleaned)
     cleaned = cleaned.strip()
-    if not cleaned:
+    stem_was_stripped = not Path(cleaned).suffix and cleaned == suffix.lstrip('.')
+    if not cleaned or stem_was_stripped:
         cleaned = f"upload_{uuid4().hex}{suffix}"
     elif suffix and Path(cleaned).suffix.lower() != suffix:
         cleaned = f"{Path(cleaned).stem}{suffix}"
