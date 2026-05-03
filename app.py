@@ -5,6 +5,7 @@
 """
 
 from __future__ import annotations
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 
 import logging
 import os
@@ -57,7 +58,46 @@ logger = logging.getLogger(__name__)
 if Flask is None or request is None or jsonify is None or render_template is None or send_from_directory is None:
     raise ImportError("Flask is required to run app.py")
 
+import json
+
+def load_users():
+    """从 users.json 加载用户字典 {username: password_hash}"""
+    users_file = Path(app.root_path) / 'users.json'
+    if not users_file.exists():
+        # 如果文件不存在，创建一个默认用户（方便首次运行）
+        default_users = {
+            "admin": generate_password_hash("admin123")
+        }
+        with open(users_file, 'w') as f:
+            json.dump(default_users, f, indent=2)
+        return default_users
+    with open(users_file, 'r') as f:
+        return json.load(f)
+
+# 全局用户字典（也可每次请求实时加载，但频繁读取无必要）
+USERS = load_users()
+
 app = Flask(__name__)
+
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-for-dev')
+# 是否强制密码保护（设为 False 表示测试环境直接可访问标注页）
+LOGIN_DISABLED = os.getenv('FLASK_LOGIN_DISABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+ANNOTATION_PASSWORD = os.getenv('ANNOTATION_PASSWORD', 'admin123')
+
+# Flask-Login 初始化
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'index'          # 未登录时重定向到首页
+login_manager.login_message = '请先输入密码访问标注后台'
+class User(UserMixin):
+    def __init__(self, username):
+        self.id = username
+@login_manager.user_loader
+def load_user(user_id):
+    if user_id == USERS:
+        return User(user_id)
+    return None
+
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv'}
@@ -533,8 +573,6 @@ class Neo4jQuery:
                 if candidates:
                     return candidates[0], candidates[1:]
 
-                # 语义兜底：当精确/包含匹配失败时，用本地 BERT 对节点文本做排序，
-                # 让“大一编程规范”这类复合短语也能落到最相近的教学节点上。
                 if self.semantic:
                     candidate_map: Dict[str, Dict[str, Any]] = {}
                     semantic_result = session.run(
@@ -1447,6 +1485,7 @@ def get_caption_generator():
                 use_asr=True,
                 use_xmodaler_video=True,
                 xmodaler_model_type='tdconved',
+                use_tden_retrieval=False,
                 device_mode=app.config.get('QUERY_DEVICE_MODE', 'cpu'),
             )
         except Exception as e:
@@ -1457,6 +1496,31 @@ def get_caption_generator():
 
 atexit.register(close_neo4j_query)
 
+@app.route('/verify_password', methods=['POST'])
+def verify_password():
+    if LOGIN_DISABLED:
+        login_user(User('admin'))
+        return jsonify({'success': True, 'redirect': url_for('annotate_page')})
+
+    data = request.get_json(silent=True) or {}
+    username = data.get('username', '')
+    password = data.get('password', '')
+
+    # 重新加载用户字典（支持热更新 JSON）
+    global USERS
+    USERS = load_users()   # 可选：每次验证时重新加载，以便动态修改
+
+    if username in USERS and check_password_hash(USERS[username], password):
+        login_user(User(username))
+        return jsonify({'success': True, 'redirect': url_for('annotate_page')})
+    else:
+        return jsonify({'success': False, 'message': '用户名或密码错误'}), 401
+
+@app.route('/logout')
+def logout():
+    logout_user()
+    return redirect(url_for('index'))
+
 
 @app.route('/')
 def index():
@@ -1465,6 +1529,8 @@ def index():
 
 @app.route('/annotate')
 def annotate_page():
+    if not LOGIN_DISABLED and not current_user.is_authenticated:
+        return redirect(url_for('index', msg='need_login'))
     if not _annotation_enabled():
         return jsonify({"error": "Manual annotation is disabled"}), 403
     return render_template('annotate.html')
@@ -1558,7 +1624,7 @@ def annotation_save():
     with _annotation_file().open('a', encoding='utf-8') as f:
         f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
-    # C 方案：保存 JSONL + 可选即时同步 Neo4j（默认开启）
+    # 保存 JSONL + 同步 Neo4j（默认）
     sync_to_neo4j = str(payload.get('sync_to_neo4j', 'true')).strip().lower() not in {'0', 'false', 'no', 'off'}
     sync_status = 'skipped'
     if sync_to_neo4j:
@@ -2357,6 +2423,7 @@ if __name__ == '__main__':
     app.config['IMAGE_NODE_MIN_SIMILARITY'] = float(os.getenv('IMAGE_NODE_MIN_SIMILARITY', '0.50'))
     app.config['IMAGE_NODE_MAX_LINKS'] = int(os.getenv('IMAGE_NODE_MAX_LINKS', '3'))
     app.config['ENABLE_MANUAL_ANNOTATION'] = os.getenv('ENABLE_MANUAL_ANNOTATION', 'false').lower() in {'1', 'true', 'yes', 'on'}
+    app.config['LOGIN_DISABLED'] = LOGIN_DISABLED
 
     logger.info("启动Flask服务器...")
     logger.info("访问: http://localhost:6006")
