@@ -111,12 +111,14 @@ class KGBuilder:
         self.text_processor = TextProcessor(nlp_model=nlp)
         self.image_processor = ImageProcessor(device_mode=self.device_mode)
         self.video_processor = VideoProcessor(device_mode=self.device_mode)
+        # 启用 TDEN 检索模型（若本地可用则加载），以增强图文/文本检索和跨模态对齐
         self.caption_generator = CaptionGenerator(
-            use_ocr=True, 
-            ocr_lang='chi_sim+eng', 
+            use_ocr=True,
+            ocr_lang='chi_sim+eng',
             use_asr=True,
             use_xmodaler_video=use_xmodaler_video,
             xmodaler_model_type=xmodaler_model_type,
+            use_tden_retrieval=True,  # 尝试加载本地 TDEN 检索模型以增强检索能力
             device_mode=self.device_mode,
         )
         self.semantic_scorer = SemanticScorer(device_mode=self.device_mode)
@@ -199,32 +201,6 @@ class KGBuilder:
         relation_type = re.sub(r'[^0-9A-Za-z_]+', '_', relation_type)
         relation_type = relation_type.upper().strip('_')
         return relation_type or 'CONNECTED'
-
-    def _node_labels(self, node_name: str, attrs: Dict) -> List[str]:
-        """
-        获取节点的Neo4j标签列表
-        优先使用存储在attrs中的labels，否则根据type推导
-        """
-        if 'labels' in attrs and attrs['labels']:
-            labels = attrs['labels']
-            if isinstance(labels, list):
-                return labels
-            elif isinstance(labels, str):
-                return [labels]
-
-        # 根据type推导标签
-        node_type = attrs.get('type', attrs.get('node_type', 'entity'))
-        base_label = 'Entity'
-
-        type_to_labels = {
-            'computer_science': ['Entity', 'KnowledgePoint'],
-            'ideology': ['Entity', 'IdeologyElement'],
-            'teaching_case': ['Entity', 'TeachingCase'],
-            'media_image': ['Entity', 'Media', 'Image'],
-            'media_video': ['Entity', 'Media', 'Video'],
-        }
-
-        return type_to_labels.get(str(node_type).strip(), [base_label])
 
     # ...existing code...
 
@@ -669,7 +645,10 @@ class KGBuilder:
     def _infer_stage_tags(self, text: str) -> List[str]:
         """从教学文本中推断学段标签。"""
         text = text or ""
+        # 教学场景里常见的“基础/初级/入门/导论/概论”一般对应大一或大学低年级内容，
+        # 这里优先归到“大一”，再保留更宽泛的学段标签，便于推荐和检索。
         stage_alias = {
+            '大一': ['大一', '大1', '基础', '初级', '入门', '导论', '概论', '零基础', '启蒙', '课程基础', '初学'],
             '小学': ['小学', '小学生', '基础教育'],
             '初中': ['初中', '中学生'],
             '高中': ['高中', '高考'],
@@ -677,16 +656,21 @@ class KGBuilder:
             '高职': ['高职', '职业教育', '职教'],
         }
         matched = [stage for stage, aliases in stage_alias.items() if any(token in text for token in aliases)]
+        if '大一' in matched:
+            # 大一是教学场景下最常见的低年级标签，优先输出，避免被“大学”淹没。
+            matched = ['大一'] + [stage for stage in matched if stage != '大一']
         return matched or ['大学']
 
     def _extract_case_structured_fields(self, title: str, raw_text: str, keywords: List[str]) -> Dict:
         """抽取教学案例结构化字段，供教学适配检索使用。"""
         source_text = f"{title}\n{raw_text}"
         isbn_match = re.search(r'ISBN[:：]?\s*([0-9\-Xx]+)', source_text)
-        chapter_titles = re.findall(r'(?:第[一二三四五六七八九十百\d]+章[^\n]{0,40})', source_text)
+        chapter_titles = re.findall(r'第[一二三四五六七八九十百\d]+章[^\n]{0,40}', source_text)
 
         discipline_lexicon = [
-            '计算机', '软件工程', '人工智能', '机器学习', '大数据', '数据库', '网络', '程序设计', 'Python', 'Hadoop'
+            '计算机', '软件工程', '人工智能', '机器学习', '大数据', '数据库', '网络', '程序设计', '编程', '代码规范',
+            '规范化', '编程规范', 'Python', 'Hadoop', '算法', '操作系统', '数据结构', '计算机网络', '入门', '基础', '初级',
+            '导论', '概论', '大一'
         ]
         disciplines = [token for token in discipline_lexicon if token.lower() in source_text.lower()]
 
@@ -975,15 +959,19 @@ class KGBuilder:
 
         # 拼音匹配兜底（可选）
         if len(matches) < top_k:
-            pinyin = None
+            pinyin_module = None
             try:
-                import pinyin
+                import pinyin as pinyin_module
+            except ImportError:
+                logger.debug("pinyin库未安装，跳过拼音匹配")
+
+            if pinyin_module is not None:
                 for caption_entity in caption_entities:
-                    caption_pinyin = pinyin.get(caption_entity, format="strip", delimiter="")
+                    caption_pinyin = pinyin_module.get(caption_entity, format="strip", delimiter="")
                     for known_entity in known_entities:
                         if known_entity in matched_entities:
                             continue
-                        known_pinyin = pinyin.get(known_entity, format="strip", delimiter="")
+                        known_pinyin = pinyin_module.get(known_entity, format="strip", delimiter="")
                         if caption_pinyin and known_pinyin and caption_pinyin.lower() in known_pinyin.lower():
                             matches.append((known_entity, 0.6))
                             matched_entities.add(known_entity)
@@ -991,8 +979,6 @@ class KGBuilder:
                             break
                     if len(matches) >= top_k:
                         break
-            except ImportError:
-                logger.debug("pinyin库未安装，跳过拼音匹配")
 
         matches.sort(key=lambda item: item[1], reverse=True)
         return matches[:top_k]
@@ -1000,20 +986,56 @@ class KGBuilder:
     def _build_teaching_cases(self, known_entities: Dict[str, Dict], output_dir: str):
         """把文本语料建成教学案例节点，并与知识点/思政元素相连。"""
         case_relations = {}
+        # 候选实体来源：优先来自已知实体（文本抽取），其次补充预置的计算机知识点与思政元素
+        candidate_entities = {}
+        for entity, info in known_entities.items():
+            candidate_entities[entity] = {
+                'name': entity,
+                'type': info.get('type', ''),
+                'keywords': list(info.get('keywords', []))[:10],
+                'source': info.get('source', ''),
+                'sources': sorted(list(info.get('sources', []))) if isinstance(info.get('sources', []), (set, list, tuple)) else [],
+            }
+
+        # 补充预置实体（insert_predefined_entities 会将其放入 self.entity_types）
+        for ent in (self.entity_types.get('computer_science') or []):
+            if ent and ent not in candidate_entities:
+                candidate_entities[ent] = {'name': ent, 'type': 'computer_science', 'keywords': [ent], 'source': 'predefined', 'sources': []}
+        for ent in (self.entity_types.get('ideology') or []):
+            if ent and ent not in candidate_entities:
+                candidate_entities[ent] = {'name': ent, 'type': 'ideology', 'keywords': [ent], 'source': 'predefined', 'sources': []}
+
         for case_name, case_info in self.case_records.items():
+            case_title = case_info.get('title', case_name)
+            case_summary = case_info.get('summary', '')
+            case_keywords = case_info.get('keywords', []) or []
+            case_stage_tags = case_info.get('stage_tags', []) or []
+            case_course_tags = case_info.get('course_tags', []) or []
+            case_objectives = case_info.get('teaching_objectives', []) or []
+            case_profile = ' '.join([
+                case_title,
+                case_summary,
+                ' '.join(case_keywords),
+                ' '.join(case_stage_tags),
+                ' '.join(case_course_tags),
+                ' '.join(case_objectives),
+                case_info.get('raw_text', ''),
+            ]).strip()
+
             knowledge_points = sorted({
                 entity for entity in case_info.get('entities', [])
                 if entity in known_entities and known_entities.get(entity, {}).get('type') == 'computer_science'
             })
+
             self.graph.add_node(
                 case_name,
                 type='teaching_case',
                 labels=['Entity', 'TeachingCase'],
                 case_id=case_name,
                 node_kind='teaching_case',
-                title=case_info.get('title', case_name),
-                summary=case_info.get('summary', ''),
-                keywords=case_info.get('keywords', []),
+                title=case_title,
+                summary=case_summary,
+                keywords=case_keywords,
                 source_file=case_info.get('source_file', ''),
                 media_type='text',
                 media_url='',
@@ -1021,62 +1043,141 @@ class KGBuilder:
                 knowledge_point_count=len(knowledge_points),
                 videos=[],
                 video_count=0,
-                stage_tags=case_info.get('stage_tags', []),
-                course_tags=case_info.get('course_tags', []),
+                stage_tags=case_stage_tags,
+                course_tags=case_course_tags,
                 ideology_tags=case_info.get('ideology_tags', []),
-                teaching_objectives=case_info.get('teaching_objectives', []),
+                teaching_objectives=case_objectives,
                 chapter_count=case_info.get('chapter_count', 0),
                 chapter_titles=case_info.get('chapter_titles', []),
                 isbn=case_info.get('isbn', ''),
             )
 
-            ranked = self.semantic_scorer.rank_candidates(
-                case_info.get('summary', '') or case_info.get('raw_text', ''),
-                {
-                    entity: {
-                        'name': entity,
-                        'type': info.get('type', ''),
-                        'keywords': list(info.get('keywords', []))[:8],
-                        'source': info.get('source', ''),
-                    }
-                    for entity, info in known_entities.items()
-                },
-                top_k=5,
-            )
-
+            direct_hits = []
             for entity in case_info.get('entities', []):
                 if entity in known_entities:
-                    self.graph.add_edge(case_name, entity,
-                                        relation='MENTIONS',
-                                        similarity=1.0,
-                                        caption=case_info.get('summary', ''),
-                                        media_type='text')
+                    direct_hits.append(entity)
+                    self.graph.add_edge(
+                        case_name,
+                        entity,
+                        relation='MENTIONS',
+                        similarity=1.0,
+                        caption=case_summary or case_title,
+                        media_type='text',
+                    )
                     self.relations['MENTIONS'].append((case_name, entity, 1.0))
                     case_relations[f'{case_name}--{entity}'] = {
                         'case': case_name,
                         'entity': entity,
                         'relation': 'MENTIONS',
                         'similarity': 1.0,
-                        'summary': case_info.get('summary', ''),
+                        'summary': case_summary,
+                        'title': case_title,
                     }
+
+            ranked = self.semantic_scorer.rank_candidates(
+                case_profile,
+                candidate_entities,
+                top_k=8,
+            )
+
+            # 让教学案例在“标题/摘要/关键词/学段”命中时也能稳定连边，避免 relation 文件为空。
+            related_threshold = 0.30 if case_stage_tags or case_course_tags else 0.38
+            if not direct_hits:
+                related_threshold = min(related_threshold, 0.28)
 
             for item in ranked:
                 entity = item['name']
-                if item['score'] < 0.45 or entity not in known_entities:
+                if entity not in known_entities:
                     continue
-                self.graph.add_edge(case_name, entity,
-                                    relation='RELATED',
-                                    similarity=float(item['score']),
-                                    caption=case_info.get('summary', ''),
-                                    media_type='text')
-                self.relations['RELATED'].append((case_name, entity, float(item['score'])))
-                case_relations[f'{case_name}--{entity}--related'] = {
+                score = float(item.get('score', 0.0))
+                if score < related_threshold:
+                    continue
+
+                relation_type = 'RELATED'
+                if any(token in case_profile for token in [entity] + list(case_keywords)):
+                    relation_type = 'MENTIONS'
+
+                self.graph.add_edge(
+                    case_name,
+                    entity,
+                    relation=relation_type,
+                    similarity=score,
+                    caption=case_summary or case_title,
+                    media_type='text',
+                )
+                self.relations[relation_type].append((case_name, entity, score))
+                case_relations[f'{case_name}--{entity}--{relation_type.lower()}'] = {
                     'case': case_name,
                     'entity': entity,
-                    'relation': 'RELATED',
-                    'similarity': float(item['score']),
-                    'summary': case_info.get('summary', ''),
+                    'relation': relation_type,
+                    'similarity': score,
+                    'summary': case_summary,
+                    'title': case_title,
+                    'stage_tags': case_stage_tags,
+                    'course_tags': case_course_tags,
                 }
+                # 如果命中的是思政实体且相似度较高，标注为思政相关标签
+                try:
+                    if (self.entity_types.get('ideology') and entity in set(self.entity_types.get('ideology', []))):
+                        # 将教学案例的 ideolgy_tags 补充
+                        if 'ideology_tags' not in self.graph.nodes[case_name]:
+                            self.graph.nodes[case_name]['ideology_tags'] = []
+                        if entity not in self.graph.nodes[case_name]['ideology_tags']:
+                            self.graph.nodes[case_name]['ideology_tags'].append(entity)
+                except Exception:
+                    pass
+
+            # 额外策略：当已知实体不足或语义模型多样性时，直接把预置的思政实体按语义相似度打分并建立边
+            if (not ranked or len([r for r in ranked if r.get('score', 0) >= related_threshold]) == 0) and self.entity_types.get('ideology'):
+                for ideology in self.entity_types.get('ideology', []):
+                    try:
+                        sim = float(self.semantic_scorer.similarity(case_profile, ideology)) if self.semantic_scorer else 0.0
+                    except Exception:
+                        sim = 0.0
+                    if sim >= max(0.30, related_threshold - 0.05):
+                        relation_type = 'RELATED' if sim < 0.55 else 'MENTIONS'
+                        self.graph.add_edge(
+                            case_name,
+                            ideology,
+                            relation=relation_type,
+                            similarity=sim,
+                            caption=case_summary or case_title,
+                            media_type='text',
+                        )
+                        self.relations[relation_type].append((case_name, ideology, sim))
+                        case_relations[f'{case_name}--{ideology}--auto'] = {
+                            'case': case_name,
+                            'entity': ideology,
+                            'relation': relation_type,
+                            'similarity': round(float(sim), 4),
+                            'summary': case_summary,
+                            'title': case_title,
+                        }
+            # 再做一次兜底：如果仍然没有任何边，则给最相关的 1 个知识点建立 RELATED，保证教学案例可检索。
+            if not any(key.startswith(f'{case_name}--') for key in case_relations):
+                fallback = [item for item in ranked if item.get('name') in known_entities]
+                if fallback:
+                    item = fallback[0]
+                    entity = item['name']
+                    score = float(item.get('score', 0.0))
+                    if score > 0:
+                        self.graph.add_edge(
+                            case_name,
+                            entity,
+                            relation='RELATED',
+                            similarity=score,
+                            caption=case_summary or case_title,
+                            media_type='text',
+                        )
+                        self.relations['RELATED'].append((case_name, entity, score))
+                        case_relations[f'{case_name}--{entity}--fallback'] = {
+                            'case': case_name,
+                            'entity': entity,
+                            'relation': 'RELATED',
+                            'similarity': score,
+                            'summary': case_summary,
+                            'title': case_title,
+                        }
 
             case_attrs = self.graph.nodes[case_name]
             case_attrs['knowledge_points'] = knowledge_points
