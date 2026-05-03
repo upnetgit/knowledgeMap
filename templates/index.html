@@ -330,10 +330,29 @@
                 <div class="section">
                     <h2>⬆️ 上传并增量入图</h2>
                     <div class="upload-box">
-                        <input type="file" id="mediaUploadInput" accept="image/*,video/*">
+                        <input type="file" id="mediaUploadInput" accept="image/*,video/*,audio/*,.mp4,.avi,.mov,.mkv,.ts,.m2ts,.mp3,.wav,.m4a,.aac,.flac,.ogg">
                         <button style="margin-top:8px; width:100%;" onclick="uploadAndIngest()">上传并处理</button>
                         <div id="uploadStatus" style="margin-top:8px; color:#666; font-size:12px;"></div>
                     </div>
+                </div>
+
+                <div class="section">
+                    <h2>📝 文本上传入图</h2>
+                    <div class="upload-box">
+                        <input type="file" id="textUploadInput" accept=".txt,text/plain">
+                        <button style="margin-top:8px; width:100%;" onclick="uploadAndIngestText()">上传文本并入图</button>
+                        <div id="textUploadStatus" style="margin-top:8px; color:#666; font-size:12px;"></div>
+                    </div>
+                </div>
+
+	            <div class="section">
+                    <h2>🔐 标注后台入口</h2>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <input type="text" id="annotateUser" placeholder="用户名" style="flex:1;">
+                            <input type="password" id="annotatePwd" placeholder="密码" style="flex:1;">
+                            <button id="gotoAnnotateBtn">进入标注</button>
+                        </div>
+                    <div id="pwdError" style="color:#b42318; font-size:12px; margin-top:6px;"></div>
                 </div>
             </div>
             
@@ -376,9 +395,11 @@
     </div>
     
     <script>
+        let currentFocusEntity = '';
+
         // 初始化知识图谱
         function initializeGraph() {
-            renderGraph({nodes: [], links: [], stats: {total_nodes: 0, total_edges: 0}});
+            renderGraph({nodes: [], links: [], stats: {total_nodes: 0, total_edges: 0}}, currentFocusEntity);
             updateStats({total_nodes: 0, total_edges: 0});
             renderCharts({relation_distribution: {}, media_distribution: {}});
         }
@@ -394,18 +415,42 @@
 
         function loadSubgraph(entity) {
             if (!entity) return;
+            currentFocusEntity = entity;
             fetch(`/api/graph/subgraph?entity=${encodeURIComponent(entity)}&hops=2`)
                 .then(response => response.json())
                 .then(data => {
-                    renderGraph(data);
+                    renderGraph(data, currentFocusEntity);
                     updateStats(data.stats || {total_nodes: 0, total_edges: 0});
                     renderCharts(data.charts || {relation_distribution: {}, media_distribution: {}});
                 })
                 .catch(error => console.error('Subgraph Error:', error));
         }
-        
+
+        function pickPrimaryEntity(payload) {
+            if (!payload || typeof payload !== 'object') return '';
+            if (payload.primary_entity) return payload.primary_entity;
+            if (Array.isArray(payload.created_entities) && payload.created_entities.length > 0) return payload.created_entities[0];
+            if (Array.isArray(payload.linked_entities) && payload.linked_entities.length > 0) return payload.linked_entities[0];
+            return '';
+        }
+
+        function handlePostIngestFocus(payload) {
+            const targetEntity = pickPrimaryEntity(payload);
+            if (!targetEntity) {
+                return;
+            }
+
+            document.getElementById('searchInput').value = targetEntity;
+            displayEntityDetails(targetEntity);
+            loadSubgraph(targetEntity);
+            fetch(`/api/query?entity=${encodeURIComponent(targetEntity)}`)
+                .then(response => response.json())
+                .then(results => displayResults(results))
+                .catch(err => console.error('Post ingest query error:', err));
+        }
+
         // 渲染知识图谱
-        function renderGraph(data) {
+        function renderGraph(data, focusEntity = '') {
             const container = document.getElementById('graph-container');
             container.innerHTML = ''; // 清空容器
             
@@ -525,7 +570,29 @@
                         .then(results => displayResults(results))
                         .catch(err => console.error('Node query error:', err));
                 });
-            
+
+            if (focusEntity) {
+                const target = (data.nodes || []).find(n => n.id === focusEntity);
+                if (target) {
+                    const scale = 1.2;
+                    const tx = width / 2 - (target.x || width / 2) * scale;
+                    const ty = height / 2 - (target.y || height / 2) * scale;
+                    svg.transition().duration(600).call(
+                        zoom.transform,
+                        d3.zoomIdentity.translate(tx, ty).scale(scale)
+                    );
+
+                    nodes
+                        .filter(d => d.id === focusEntity)
+                        .attr('stroke', '#ff4d4f')
+                        .attr('stroke-width', 3)
+                        .transition()
+                        .duration(1800)
+                        .attr('stroke', '#ffffff')
+                        .attr('stroke-width', 1.5);
+                }
+            }
+
             const labels = labelGroup.selectAll('text')
                 .data(data.nodes)
                 .enter()
@@ -604,7 +671,13 @@
                 item.className = 'result-item';
                 const mediaType = result.media || result.media_type || 'N/A';
                 const mediaUrl = result.clip_path || result.clip_url || result.media_url || result.path || result.source_file || '';
-                const isVideo = String(mediaType).toLowerCase() === 'video' && !!mediaUrl;
+                const lowerUrl = String(mediaUrl || '').toLowerCase();
+                const isVideo = (
+                    String(mediaType).toLowerCase() === 'video'
+                    || String(result.relation || '').toUpperCase() === 'MEDIA_LINKED_VIDEO'
+                    || /\.(mp4|avi|mov|mkv|ts|m2ts)(\?|#|$)/i.test(lowerUrl)
+                ) && !!mediaUrl;
+                const safeMediaUrl = mediaUrl ? encodeURI(mediaUrl) : '';
                 item.innerHTML = `
                     <div class="entity-name">${escapeHtml(result.entity)}</div>
                     <div class="relation">关系: ${escapeHtml(result.relation)}</div>
@@ -612,7 +685,7 @@
                     ${isVideo ? `
                         <div class="media-info">视频链接: ${escapeHtml(mediaUrl)}</div>
                         <video controls style="width:100%; margin-top:8px; max-height:220px; border-radius:4px;">
-                            <source src="${mediaUrl}" type="video/mp4">
+                            <source src="${safeMediaUrl}" type="video/mp4">
                             您的浏览器不支持视频标签。
                         </video>
                     ` : ''}
@@ -679,15 +752,57 @@
                 }
 
                 status.textContent = `完成: ${ingestData.summary || '已更新图谱'}`;
-                const q = document.getElementById('searchInput').value;
-                if (q) {
-                    loadSubgraph(q);
-                }
+                handlePostIngestFocus(ingestData);
             } catch (err) {
                 status.textContent = `操作失败: ${err}`;
             }
         }
-        
+
+        async function uploadAndIngestText() {
+            const input = document.getElementById('textUploadInput');
+            const status = document.getElementById('textUploadStatus');
+            if (!input.files || input.files.length === 0) {
+                status.textContent = '请先选择 .txt 文件';
+                return;
+            }
+
+            const file = input.files[0];
+            if (!String(file.name || '').toLowerCase().endsWith('.txt')) {
+                status.textContent = '仅支持 .txt 文本文件';
+                return;
+            }
+
+            const form = new FormData();
+            form.append('file', file);
+            status.textContent = '文本上传中...';
+
+            try {
+                const uploadResp = await fetch('/api/upload_text', { method: 'POST', body: form });
+                const uploadData = await uploadResp.json();
+                if (!uploadResp.ok) {
+                    status.textContent = `上传失败: ${uploadData.error || 'unknown'}`;
+                    return;
+                }
+
+                status.textContent = '文本入图中...';
+                const ingestResp = await fetch('/api/ingest_text', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ relative_path: uploadData.relative_path })
+                });
+                const ingestData = await ingestResp.json();
+                if (!ingestResp.ok) {
+                    status.textContent = `入图失败: ${ingestData.error || 'unknown'}`;
+                    return;
+                }
+
+                status.textContent = ingestData.summary || '文本入图完成';
+                handlePostIngestFocus(ingestData);
+            } catch (err) {
+                status.textContent = `操作失败: ${err}`;
+            }
+        }
+
         // 显示实体详情
         function displayEntityDetails(entity) {
             const container = document.getElementById('entityDetails');
@@ -757,7 +872,28 @@
 
                         container.appendChild(recSection);
                     }
-                    
+
+                    if (data.images && data.images.length > 0) {
+                        const imageSection = document.createElement('div');
+                        imageSection.className = 'section';
+                        imageSection.innerHTML = '<h3>相关图片</h3>';
+
+                        data.images.forEach(image => {
+                            const card = document.createElement('div');
+                            card.className = 'video-item';
+                            const imageSrc = image.media_url || image.path || '';
+                            const safeImageSrc = imageSrc ? encodeURI(imageSrc) : '';
+                            card.innerHTML = `
+                                <h4>${escapeHtml(image.name || '图片')}</h4>
+                                <p>${escapeHtml(image.caption || '')}</p>
+                                <img src="${safeImageSrc}" alt="${escapeHtml(image.name || '图片')}" style="width:100%; max-height:260px; object-fit:contain; border-radius:4px; border:1px solid #eee;" />
+                            `;
+                            imageSection.appendChild(card);
+                        });
+
+                        container.appendChild(imageSection);
+                    }
+
                     // 显示视频
                     if (data.videos.length > 0) {
                         const videoSection = document.getElementById('videoPlayer');
@@ -767,11 +903,12 @@
                             const videoItem = document.createElement('div');
                             videoItem.className = 'video-item';
                             const videoSrc = video.clip_path || video.clip_url || video.media_url || video.path || '';
+                            const safeVideoSrc = videoSrc ? encodeURI(videoSrc) : '';
                             videoItem.innerHTML = `
                                 <h4>${video.name}</h4>
                                 <p>${video.caption}</p>
                                 <video controls>
-                                    <source src="${videoSrc}" type="video/mp4">
+                                    <source src="${safeVideoSrc}" type="video/mp4">
                                     您的浏览器不支持视频标签。
                                 </video>
                             `;
@@ -805,7 +942,42 @@
         }
         
         // 页面加载时初始化
-        document.addEventListener('DOMContentLoaded', initializeGraph);
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeGraph();
+
+            // 获取标注后台入口的元素
+            const btn = document.getElementById('gotoAnnotateBtn');
+            if (btn) {
+                btn.addEventListener('click', async function() {
+                    const username = document.getElementById('annotateUser')?.value.trim() || '';
+                    const password = document.getElementById('annotatePwd')?.value.trim() || '';
+                    const errorDiv = document.getElementById('pwdError');
+
+                    // 检查用户名和密码是否为空（可根据需求决定是否需要用户名）
+                    if (!username || !password) {
+                        if (errorDiv) errorDiv.textContent = '请输入用户名和密码';
+                        return;
+                    }
+
+                    try {
+                        const resp = await fetch('/verify_password', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: username, password: password })
+                        });
+                        const data = await resp.json();
+                        if (data.success) {
+                            window.location.href = data.redirect;
+                        } else {
+                            if (errorDiv) errorDiv.textContent = data.message || '用户名或密码错误';
+                        }
+                    } catch (err) {
+                        if (errorDiv) errorDiv.textContent = '验证失败，请稍后重试';
+                        console.error(err);
+                    }
+                });
+            }
+        });
     </script>
 </body>
 </html>
