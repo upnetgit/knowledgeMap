@@ -15,6 +15,7 @@ import json
 import importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -38,17 +39,63 @@ def _flatten_text(value: Any) -> str:
         return ""
     if isinstance(value, (str, int, float)):
         return str(value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         parts = []
         for key in ("name", "title", "summary", "caption", "description", "keywords", "source", "label", "type"):
-            if key in value:
+            if key in value and not callable(value[key]):
                 parts.append(_flatten_text(value[key]))
         if not parts:
-            parts.extend(_flatten_text(v) for v in value.values())
+            for k, v in value.items():
+                if callable(k) or callable(v):
+                    continue
+                parts.append(_flatten_text(v))
         return " ".join(part for part in parts if part)
     if isinstance(value, (list, tuple, set)):
         return " ".join(_flatten_text(v) for v in value)
     return str(value)
+
+
+_TEACHING_ALIAS_GROUPS = {
+    '大一': ['大一', '大1', '基础', '初级', '入门', '导论', '概论', '零基础', '启蒙', '课程基础', '初学'],
+    '编程': ['编程', '程序设计', '代码', '程序', '代码规范', '编程规范'],
+    '规范': ['规范', '规范化', '标准', '准则', '规程'],
+    '数据结构': ['数据结构', '栈', '队列', '树', '图', '哈希'],
+    '数据库': ['数据库', '关系模式', '索引', '事务', '并发控制'],
+    '算法': ['算法', '排序', '搜索', '动态规划', '贪心'],
+    '操作系统': ['操作系统', '进程', '线程', '死锁', '内存管理'],
+    '计算机网络': ['计算机网络', 'TCP', 'OSI', '路由', '协议'],
+    '软件工程': ['软件工程', '测试', '需求分析', '版本控制', '敏捷'],
+}
+
+
+def normalize_teaching_terms(text: str) -> str:
+    text = str(text or "")
+    return re.sub(r"\s+", "", text)
+
+
+def detect_stage_tags(text: str) -> List[str]:
+    normalized = normalize_teaching_terms(text)
+    if not normalized:
+        return []
+
+    matched: List[str] = []
+    for stage, aliases in _TEACHING_ALIAS_GROUPS.items():
+        if any(alias in normalized for alias in aliases):
+            matched.append(stage)
+
+    if "大一" in matched:
+        matched = ["大一"] + [item for item in matched if item != "大一"]
+    elif "大二" in matched:
+        matched = ["大二"] + [item for item in matched if item != "大二"]
+
+    seen = set()
+    deduped = []
+    for item in matched:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
 
 
 class SemanticScorer:
@@ -139,16 +186,26 @@ class SemanticScorer:
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        # 中文按字/词混合处理，英文按单词处理
-        tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_.-]+", text.lower())
+        # 中文按词/短语/字混合处理，英文按单词处理；保留教学场景常见短语，避免只剩单字。
+        normalized = text.lower()
+        tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_.-]+", normalized)
         if not tokens:
             return []
         expanded: List[str] = []
         for token in tokens:
             if len(token) > 1 and re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                expanded.append(token)
                 expanded.extend(list(token))
+                if len(token) > 2:
+                    expanded.extend(token[i:i + 2] for i in range(len(token) - 1))
             else:
                 expanded.append(token)
+
+        compact = re.sub(r"\s+", "", normalized)
+        for canonical, aliases in _TEACHING_ALIAS_GROUPS.items():
+            if any(alias.lower() in compact for alias in aliases):
+                expanded.append(canonical)
+                expanded.extend(alias for alias in aliases if alias.lower() in compact)
         return expanded
 
     def _lexical_similarity(self, text_a: str, text_b: str) -> float:
@@ -166,7 +223,8 @@ class SemanticScorer:
 
         jaccard = len(tokens_a & tokens_b) / max(len(tokens_a | tokens_b), 1)
         coverage = len(tokens_a & tokens_b) / max(min(len(tokens_a), len(tokens_b)), 1)
-        return 0.6 * jaccard + 0.4 * coverage
+        # 教学语义里更重视“主题词是否覆盖到”，适当提高覆盖率权重。
+        return 0.5 * jaccard + 0.5 * coverage
 
     def encode(self, texts: Sequence[str]) -> Optional[np.ndarray]:
         if not self.available or self.tokenizer is None or self.model is None or torch is None:
@@ -224,18 +282,28 @@ class SemanticScorer:
         if not candidate_items:
             return []
 
-        texts = [query_text] + [_flatten_text(meta) or name for name, meta in candidate_items]
+        normalized_items: List[Tuple[str, Any]] = []
+        for name, meta in candidate_items:
+            if callable(name):
+                continue
+            normalized_name = self._normalize(str(name))
+            normalized_items.append((normalized_name or str(name), meta))
+
+        if not normalized_items:
+            return []
+
+        texts = [query_text] + [_flatten_text(meta) or name for name, meta in normalized_items]
         embeddings = self.encode(texts)
 
         results: List[Dict[str, Any]] = []
         if embeddings is not None:
             query_vec = embeddings[0]
-            for idx, (name, meta) in enumerate(candidate_items, start=1):
+            for idx, (name, meta) in enumerate(normalized_items, start=1):
                 score = float(np.clip(np.dot(query_vec, embeddings[idx]), 0.0, 1.0))
                 score = 0.85 * score + 0.15 * self._lexical_similarity(query_text, f"{name} {_flatten_text(meta)}")
                 results.append({"name": name, "score": round(score, 4), "meta": meta})
         else:
-            for name, meta in candidate_items:
+            for name, meta in normalized_items:
                 score = self._lexical_similarity(query_text, f"{name} {_flatten_text(meta)}")
                 results.append({"name": name, "score": round(float(score), 4), "meta": meta})
 
@@ -383,5 +451,4 @@ def summarize_text(text: str, max_sentences: int = 2, max_chars: int = 160) -> s
     return summary
 
 
-__all__ = ["SemanticScorer", "RelationReranker", "summarize_text"]
-
+__all__ = ["SemanticScorer", "RelationReranker", "summarize_text", "detect_stage_tags", "normalize_teaching_terms"]
