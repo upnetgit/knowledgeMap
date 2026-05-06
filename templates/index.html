@@ -413,6 +413,26 @@
                 .replace(/'/g, '&#39;');
         }
 
+        function resolveMediaUrl(item) {
+            if (!item || typeof item !== 'object') return '';
+            const mediaKind = String(item.media_type || item.media || '').toLowerCase();
+            // 后端已做存在性校验，前端仅消费确认可播放的 URL。
+            const candidates = mediaKind === 'video'
+                ? [item.media_url, item.url]
+                : [item.media_url, item.url, item.path, item.source_file];
+            for (const raw of candidates) {
+                const value = String(raw || '').trim();
+                if (!value) continue;
+                if (/^(https?:)?\/\//i.test(value) || value.startsWith('/media/') || value.startsWith('/uploads/')) {
+                    return encodeURI(value);
+                }
+                if (mediaKind !== 'video') {
+                    return encodeURI(`/media/${value.replace(/^\/+/, '')}`);
+                }
+            }
+            return '';
+        }
+
         function loadSubgraph(entity) {
             if (!entity) return;
             currentFocusEntity = entity;
@@ -511,6 +531,7 @@
                 if (t === 'case') return '#8e44ad';
                 if (t === 'ideology') return '#e74c3c';
                 if (t === 'knowledge') return '#3498db';
+                if (t === 'knowledge_category') return '#1abc9c';
                 return '#667eea';
             };
             
@@ -670,14 +691,13 @@
                 const item = document.createElement('div');
                 item.className = 'result-item';
                 const mediaType = result.media || result.media_type || 'N/A';
-                const mediaUrl = result.clip_path || result.clip_url || result.media_url || result.path || result.source_file || '';
+                const mediaUrl = resolveMediaUrl(result);
                 const lowerUrl = String(mediaUrl || '').toLowerCase();
                 const isVideo = (
                     String(mediaType).toLowerCase() === 'video'
                     || String(result.relation || '').toUpperCase() === 'MEDIA_LINKED_VIDEO'
                     || /\.(mp4|avi|mov|mkv|ts|m2ts)(\?|#|$)/i.test(lowerUrl)
                 ) && !!mediaUrl;
-                const safeMediaUrl = mediaUrl ? encodeURI(mediaUrl) : '';
                 item.innerHTML = `
                     <div class="entity-name">${escapeHtml(result.entity)}</div>
                     <div class="relation">关系: ${escapeHtml(result.relation)}</div>
@@ -685,7 +705,7 @@
                     ${isVideo ? `
                         <div class="media-info">视频链接: ${escapeHtml(mediaUrl)}</div>
                         <video controls style="width:100%; margin-top:8px; max-height:220px; border-radius:4px;">
-                            <source src="${safeMediaUrl}" type="video/mp4">
+                            <source src="${mediaUrl}" type="video/mp4">
                             您的浏览器不支持视频标签。
                         </video>
                     ` : ''}
@@ -743,7 +763,12 @@
                 const ingestResp = await fetch('/api/ingest_media', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ relative_path: uploadData.relative_path })
+                    body: JSON.stringify({
+                        relative_path: uploadData.relative_path,
+                        stored_filename: uploadData.stored_filename || '',
+                        display_name: uploadData.display_name || uploadData.stored_filename || uploadData.original_filename || '',
+                        original_filename: uploadData.original_filename || '',
+                    })
                 });
                 const ingestData = await ingestResp.json();
                 if (!ingestResp.ok) {
@@ -902,13 +927,15 @@
                         data.videos.forEach(video => {
                             const videoItem = document.createElement('div');
                             videoItem.className = 'video-item';
-                            const videoSrc = video.clip_path || video.clip_url || video.media_url || video.path || '';
-                            const safeVideoSrc = videoSrc ? encodeURI(videoSrc) : '';
+                            const videoSrc = resolveMediaUrl(video);
+                            if (!videoSrc) {
+                                return;
+                            }
                             videoItem.innerHTML = `
                                 <h4>${video.name}</h4>
                                 <p>${video.caption}</p>
                                 <video controls>
-                                    <source src="${safeVideoSrc}" type="video/mp4">
+                                    <source src="${videoSrc}" type="video/mp4">
                                     您的浏览器不支持视频标签。
                                 </video>
                             `;
