@@ -31,9 +31,10 @@ try:
     jsonify = _flask_module.jsonify
     render_template = _flask_module.render_template
     send_from_directory = _flask_module.send_from_directory
+    url_for = _flask_module.url_for
 except Exception:
     Flask = None
-    request = jsonify = render_template = send_from_directory = None
+    request = jsonify = render_template = send_from_directory = url_for = None
 
 try:
     _werkzeug_utils = importlib.import_module("werkzeug.utils")
@@ -60,6 +61,8 @@ if Flask is None or request is None or jsonify is None or render_template is Non
 
 import json
 
+app = Flask(__name__)
+
 def load_users():
     """从 users.json 加载用户字典 {username: password_hash}"""
     users_file = Path(app.root_path) / 'users.json'
@@ -77,7 +80,7 @@ def load_users():
 # 全局用户字典（也可每次请求实时加载，但频繁读取无必要）
 USERS = load_users()
 
-app = Flask(__name__)
+
 
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-for-dev')
 # 是否强制密码保护（设为 False 表示测试环境直接可访问标注页）
@@ -94,7 +97,7 @@ class User(UserMixin):
         self.id = username
 @login_manager.user_loader
 def load_user(user_id):
-    if user_id == USERS:
+    if user_id in USERS:
         return User(user_id)
     return None
 
@@ -109,6 +112,15 @@ def _safe_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _has_informative_content(*texts: Optional[str], min_chars: int = 10) -> bool:
+    """判断描述是否足够有效，避免在弱内容上强行建边。"""
+    merged = _safe_text(' '.join([_safe_text(item) for item in texts if _safe_text(item)]))
+    if not merged:
+        return False
+    core = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', merged)
+    return len(core) >= int(min_chars)
+
+
 def _split_csv(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -117,17 +129,49 @@ def _split_csv(value: Optional[str]) -> List[str]:
 
 def _sanitize_upload_filename(filename: str) -> str:
     raw = str(filename or '').strip()
-    suffix = Path(raw).suffix.lower()
-    cleaned = raw
-    if secure_filename:
-        cleaned = secure_filename(cleaned)
-    cleaned = cleaned.strip()
-    if not cleaned:
-        cleaned = f"upload_{uuid4().hex}{suffix}"
-    elif suffix and Path(cleaned).suffix.lower() != suffix:
-        cleaned = f"{Path(cleaned).stem}{suffix}"
-    return cleaned
+    p = Path(raw)
+    stem = p.stem
+    suffix = p.suffix.lower()
 
+    # 尽量保留原始文件名语义，只替换 Windows/URL 不安全字符。
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', stem)
+    stem = re.sub(r'\s+', '_', stem).strip(' .')
+    if not stem or len(re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', stem)) < 2:
+        stem = 'upload'
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f"{stem}_{timestamp}{suffix}"
+
+
+def _display_upload_name(filename: str) -> str:
+    """生成更适合界面展示/入图的上传文件名（原始名 + 时间戳）。"""
+    raw = str(filename or '').strip()
+    stem = Path(raw).stem if raw else ''
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', stem)
+    stem = re.sub(r'\s+', '_', stem).strip(' .')
+    if not stem or len(re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', stem)) < 2:
+        stem = 'upload'
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f"{stem}_{timestamp}"
+
+
+def _resolve_unique_filename(directory: Path, filename: str) -> str:
+    """
+    如果 directory/filename 已存在，则生成新文件名（添加 _数字）。
+    返回最终可用的文件名（不包含路径）。
+    """
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    target_path = directory / filename
+    if not target_path.exists():
+        return filename
+
+    counter = 1
+    while True:
+        new_name = f"{stem}_{counter}{suffix}"
+        if not (directory / new_name).exists():
+            return new_name
+        counter += 1
 
 def _classify_media_suffix(suffix: str) -> Tuple[str, str]:
     suffix = str(suffix or '').lower().strip()
@@ -222,7 +266,7 @@ def _extract_existing_entities_from_text(session: Any, query_engine: Any, paragr
             RETURN DISTINCT e.name AS name
             LIMIT 120
             """,
-            paragraphs=snippets,
+            {'paragraphs': snippets},
         )
         for row in result:
             name = _safe_text(row.get('name'))
@@ -243,7 +287,7 @@ def _extract_existing_entities_from_text(session: Any, query_engine: Any, paragr
                     continue
                 exists = session.run(
                     "MATCH (e:Entity {name: $name}) RETURN COUNT(e) AS cnt",
-                    name=resolved,
+                    {'name': resolved},
                 ).single()
                 if int((exists or {}).get('cnt', 0)) > 0:
                     seen.add(resolved)
@@ -340,10 +384,12 @@ def _list_videos_for_annotation() -> List[Dict[str, str]]:
             if not path.is_file() or path.suffix.lower() not in suffixes:
                 continue
             relative = path.relative_to(data_root).as_posix()
+            url = f"/media/{relative}"
             videos.append({
                 'name': path.name,
+                'display_name': path.stem,
                 'relative_path': relative,
-                'url': f"/media/{relative}",
+                'url': url,
                 'media_type': 'video',
                 'source_media_type': 'video',
             })
@@ -372,6 +418,43 @@ def _media_url_for_path(path_value: Optional[str]) -> str:
         return str(path_value)
 
 
+def _existing_media_url(path_value: Optional[str]) -> str:
+    """仅当媒体文件真实存在时，返回可播放 URL。"""
+    if not path_value:
+        return ''
+
+    raw = _safe_text(path_value)
+    if not raw:
+        return ''
+    if re.match(r'^(https?:)?//', raw, flags=re.I):
+        return raw
+
+    data_root = _data_root().resolve()
+    relative: Optional[str] = None
+
+    if raw.startswith('/media/'):
+        relative = raw[len('/media/'):]
+    elif raw.startswith('/uploads/'):
+        relative = raw[len('/uploads/'):]
+    else:
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            try:
+                relative = candidate.resolve().relative_to(data_root).as_posix()
+            except Exception:
+                relative = None
+        else:
+            relative = candidate.as_posix().lstrip('/')
+
+    if not relative:
+        return ''
+
+    candidate = data_root / relative
+    if candidate.exists() and candidate.is_file():
+        return f"/media/{relative}"
+    return ''
+
+
 def _preferred_playback_url(item: Dict) -> str:
     """统一播放URL策略：优先 clip_path，其次 clip_url，再回退 media_url/path。"""
     clip_path = _safe_text(item.get('clip_path'))
@@ -380,14 +463,87 @@ def _preferred_playback_url(item: Dict) -> str:
     path_value = _safe_text(item.get('path'))
 
     if clip_path:
-        return _media_url_for_path(clip_path)
+        clip_path_url = _existing_media_url(clip_path)
+        if clip_path_url:
+            return clip_path_url
     if clip_url:
-        return clip_url
+        clip_url_value = _existing_media_url(clip_url)
+        if clip_url_value:
+            return clip_url_value
     if media_url:
-        return media_url
+        media_url_value = _existing_media_url(media_url)
+        if media_url_value:
+            return media_url_value
     if path_value:
-        return _media_url_for_path(path_value)
+        path_url = _existing_media_url(path_value)
+        if path_url:
+            return path_url
     return ''
+
+
+def _infer_ideology_entities_from_computers(session: Any, entities: List[str], limit_per_entity: int = 3) -> List[str]:
+    """根据已命中的计算机知识点，补推其思政元素，增强“知识点->思政->视频”可查询链路。"""
+    if not entities:
+        return []
+
+    computer_entities: List[str] = []
+    for entity in entities:
+        name = _safe_text(entity)
+        if not name:
+            continue
+        row = session.run(
+            "MATCH (e:Entity {name: $name}) RETURN labels(e) AS labels",
+            {'name': name},
+        ).single() or {}
+        labels = set(row.get('labels') or [])
+        if 'KnowledgePoint' in labels:
+            computer_entities.append(name)
+
+    ideology_hits: List[str] = []
+    seen = set()
+    for comp in computer_entities:
+        result = session.run(
+            """
+            MATCH (c:Entity {name: $computer})-[r:COMPUTER_REFLECTS_IDEOLOGY]->(i:Entity)
+            RETURN i.name AS name, coalesce(r.similarity, 0.0) AS score
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            {'computer': comp, 'limit': max(1, int(limit_per_entity))},
+        )
+        for row in result:
+            name = _safe_text(row.get('name'))
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            ideology_hits.append(name)
+    return ideology_hits
+
+
+def _send_media_from_roots(filename: str, roots: List[Path]):
+    requested = Path(str(filename or '').lstrip('/\\'))
+    for root in roots:
+        root = Path(root)
+        candidate = root / requested
+        try:
+            if candidate.exists() and candidate.is_file():
+                return send_from_directory(str(root), requested.as_posix())
+        except Exception:
+            pass
+
+        # 兼容历史记录/重命名后的文件：按 basename 进行有限兜底搜索。
+        if requested.name:
+            try:
+                for match in root.rglob(requested.name):
+                    if match.is_file():
+                        return send_from_directory(str(match.parent), match.name)
+            except Exception:
+                continue
+
+    # 保持 Flask 的 404 语义，而不是抛 FileNotFoundError 导致 500。
+    if roots:
+        return send_from_directory(str(Path(roots[0])), requested.as_posix())
+    return send_from_directory(str(_data_root()), requested.as_posix())
 
 
 def _guess_media_type(labels: List[str], media_type: str, entity_name: str) -> str:
@@ -515,15 +671,16 @@ class Neo4jQuery:
                         """
                         MATCH (n:Entity)
                         WITH n, coalesce(n.name, '') AS name,
-                             replace(coalesce(n.name, ''), ' ', '') AS compact_name
+                             replace(coalesce(n.name, ''), ' ', '') AS compact_name,
+                             toLower($q) AS q
                         WHERE size(compact_name) >= 2
                           AND size(compact_name) <= 16
-                          AND toLower($query) CONTAINS toLower(compact_name)
+                          AND q CONTAINS toLower(compact_name)
                         RETURN name
                         ORDER BY size(name) ASC
                         LIMIT 20
                         """,
-                        query=compact,
+                        {'q': compact},
                     )
                     for record in result:
                         name = _safe_text(record.get('name'))
@@ -553,7 +710,7 @@ class Neo4jQuery:
                     MATCH (n:Entity)
                     WITH n, coalesce(n.name, '') AS name,
                          toLower(replace(coalesce(n.name, ''), ' ', '')) AS compact_name,
-                         toLower($query) AS q
+                         toLower($q) AS q
                     WHERE compact_name = q
                        OR compact_name CONTAINS q
                        OR q CONTAINS compact_name
@@ -566,7 +723,7 @@ class Neo4jQuery:
                     ORDER BY score DESC, size(name) ASC
                     LIMIT 8
                     """,
-                    query=compact,
+                    {'q': compact},
                 )
                 candidates = [record['name'] for record in result if record.get('name')]
 
@@ -610,10 +767,13 @@ class Neo4jQuery:
                             'videos': record.get('videos', []),
                         }
 
-                    ranked = self.semantic.rank_candidates(cleaned, candidate_map, top_k=8)
-                    semantic_candidates = [item['name'] for item in ranked if item.get('name') and float(item.get('score', 0.0)) >= 0.34]
-                    if semantic_candidates:
-                        return semantic_candidates[0], semantic_candidates[1:]
+                    try:
+                        ranked = self.semantic.rank_candidates(cleaned, candidate_map, top_k=8)
+                        semantic_candidates = [item['name'] for item in ranked if item.get('name') and float(item.get('score', 0.0)) >= 0.34]
+                        if semantic_candidates:
+                            return semantic_candidates[0], semantic_candidates[1:]
+                    except Exception as semantic_err:
+                        logger.warning(f"实体语义重排失败，回退词面匹配: {semantic_err}")
         except Exception as e:
             logger.warning(f"实体解析失败，回退原始输入: {e}")
 
@@ -794,7 +954,7 @@ class Neo4jQuery:
         score = min(1.0, score + stage_bonus + duration_bonus + course_bonus + prereq_bonus + objective_bonus)
         score = min(1.0, score + focus_bonus + audience_bonus + constraints_bonus + scenario_tag_bonus + media_bonus)
 
-        reason_parts = [f"关系:{relation}"]
+        reason_parts = [f"���系:{relation}"]
         if 'TeachingCase' in labels:
             reason_parts.append('教学案例节点')
         elif 'Video' in labels:
@@ -884,6 +1044,83 @@ class Neo4jQuery:
             logger.warning(f"二跳候选查询失败: {e}")
             return []
 
+    def _query_teaching_chain_candidates(self, entity: str, limit: int = 30) -> List[Dict]:
+        """教学链路专用召回：知识点/大类 -> 思政元素 -> 视频。"""
+        if not self.driver:
+            return []
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(
+                    """
+                    MATCH (k:Entity {name: $entity})-[r1:COMPUTER_REFLECTS_IDEOLOGY]->(i:Entity)
+                    OPTIONAL MATCH (i)-[r2:MEDIA_LINKED_VIDEO]->(v:Entity)
+                    WITH i, r1, v, r2
+                    RETURN i.name AS entity,
+                           'COMPUTER_REFLECTS_IDEOLOGY' AS relation,
+                           coalesce(r1.similarity, 0.0) AS similarity,
+                           coalesce(r1.caption, '') AS caption,
+                           labels(i) AS labels,
+                           coalesce(i.summary, '') AS summary,
+                           coalesce(i.path, '') AS path,
+                           coalesce(i.clip_path, '') AS clip_path,
+                           coalesce(i.clip_url, '') AS clip_url,
+                           coalesce(i.media_url, '') AS media_url,
+                           coalesce(i.media_type, '') AS media_type,
+                           coalesce(i.source_file, '') AS source_file,
+                           coalesce(i.stage_tags, []) AS stage_tags,
+                           coalesce(i.course_tags, []) AS course_tags,
+                           coalesce(i.ideology_tags, []) AS ideology_tags,
+                           coalesce(i.teaching_objectives, []) AS teaching_objectives,
+                           coalesce(v.name, '') AS linked_video,
+                           coalesce(v.media_url, '') AS linked_video_url,
+                           coalesce(v.clip_url, '') AS linked_video_clip_url,
+                           coalesce(v.clip_path, '') AS linked_video_clip_path
+                    ORDER BY similarity DESC
+                    LIMIT $limit
+                    """,
+                    {'entity': entity, 'limit': max(8, int(limit))},
+                )
+
+                items: List[Dict] = []
+                for record in result:
+                    item = dict(record)
+                    item['media'] = _guess_media_type(item.get('labels') or [], item.get('media_type', ''), item.get('entity', ''))
+                    item['media_url'] = _preferred_playback_url(item)
+
+                    linked_video = _safe_text(item.get('linked_video'))
+                    if linked_video:
+                        linked_video_item = {
+                            'entity': linked_video,
+                            'relation': 'MEDIA_LINKED_VIDEO',
+                            'similarity': float(item.get('similarity') or 0.0),
+                            'labels': ['Entity', 'Media', 'Video'],
+                            'summary': '',
+                            'path': '',
+                            'clip_path': item.get('linked_video_clip_path', ''),
+                            'clip_url': item.get('linked_video_clip_url', ''),
+                            'media_url': item.get('linked_video_url', ''),
+                            'media_type': 'video',
+                            'source_file': '',
+                            'stage_tags': [],
+                            'course_tags': [],
+                            'ideology_tags': [],
+                            'teaching_objectives': [],
+                            'via_entity': item.get('entity', ''),
+                            'hop': 2,
+                            'query_term': entity,
+                            'resolved_entity': entity,
+                            'media': 'video',
+                        }
+                        linked_video_item['media_url'] = _preferred_playback_url(linked_video_item)
+                        if linked_video_item.get('media_url'):
+                            items.append(linked_video_item)
+
+                    items.append(item)
+                return items
+        except Exception as e:
+            logger.warning(f"教学链路候选查询失败: {e}")
+            return []
+
     def query_connected_entities(self, entity: str) -> List[Dict]:
         if not self.driver:
             return []
@@ -943,6 +1180,19 @@ class Neo4jQuery:
                     dedup[key] = item
 
             merged = list(dedup.values())
+
+            # 教学链路增强：优先补充跨类关系（知识点->思政->视频）。
+            try:
+                chain_items = self._query_teaching_chain_candidates(entity, limit=24)
+                for item in chain_items:
+                    key = f"{item.get('entity','')}|{item.get('relation','')}|{item.get('media_url','')}"
+                    prev = dedup.get(key)
+                    if prev is None or float(item.get('similarity', 0.0)) > float(prev.get('similarity', 0.0)):
+                        dedup[key] = item
+                merged = list(dedup.values())
+            except Exception:
+                pass
+
             merged.sort(key=lambda x: float(x.get('similarity', 0.0)), reverse=True)
             return merged[:50]
         except Exception as e:
@@ -1001,6 +1251,8 @@ class Neo4jQuery:
                         node_type = 'ideology'
                     elif 'KnowledgePoint' in labels:
                         node_type = 'knowledge'
+                    elif 'KnowledgeCategory' in labels:
+                        node_type = 'knowledge_category'
                     nodes.append({
                         'id': name,
                         'connections': record.get('connections', 0),
@@ -1039,12 +1291,28 @@ class Neo4jQuery:
 
                 relation_distribution: Dict[str, int] = {}
                 links = []
+                node_type_map = {node.get('id'): node.get('type', 'entity') for node in nodes}
+                same_class_budget: Dict[str, int] = {}
                 for record in edge_result:
                     rel_type = record.get('type', 'CONNECTED')
+                    source = record.get('source')
+                    target = record.get('target')
+                    source_type = node_type_map.get(source, 'entity')
+                    target_type = node_type_map.get(target, 'entity')
+                    is_same_class = source_type == target_type
+
+                    # 子图渲染时弱化同类边，优先保留跨类关系。
+                    if is_same_class and rel_type in {'SIMILAR', 'RELATED', 'CONTAINS', 'EXTENDS', 'PREREQUISITE'}:
+                        budget_key = f"{source}|{rel_type}"
+                        used = same_class_budget.get(budget_key, 0)
+                        if used >= 1:
+                            continue
+                        same_class_budget[budget_key] = used + 1
+
                     relation_distribution[rel_type] = relation_distribution.get(rel_type, 0) + 1
                     links.append({
-                        'source': record.get('source'),
-                        'target': record.get('target'),
+                        'source': source,
+                        'target': target,
                         'type': rel_type,
                         'strength': max(float(record.get('similarity') or 0.0), 0.3),
                         'caption': record.get('caption', ''),
@@ -1318,9 +1586,12 @@ class Neo4jQuery:
                                     clip_url = _media_url_for_path(clip_path)
 
                         if not clip_url and clip_path:
-                            clip_url = _media_url_for_path(clip_path)
+                            clip_url = _existing_media_url(clip_path)
                         if not video_url:
-                            video_url = _media_url_for_path(video_path)
+                            video_url = _existing_media_url(video_path)
+
+                        if not video_url:
+                            continue
 
                         videos.append({
                             'name': item['entity'],
@@ -1562,6 +1833,7 @@ def annotation_save():
 
     video_name = _safe_text(payload.get('video_name'))
     video_path = _safe_text(payload.get('video_path'))
+    video_url = _safe_text(payload.get('video_url')) or (f"/media/{video_path}" if video_path else '')
     computer_entities = _normalize_multi_values(payload, 'computer_entities', 'computer_entity')
     ideology_entities = _normalize_multi_values(payload, 'ideology_entities', 'ideology_entity')
 
@@ -1593,14 +1865,39 @@ def annotation_save():
     audience = _safe_text(payload.get('audience'))
     source_media_type = _safe_text(payload.get('source_media_type')) or _classify_media_suffix(Path(video_path).suffix.lower())[0]
 
+    query_engine = get_neo4j_query()
+    clip_path = ''
+    clip_url = ''
+    source_video_path = video_path
+    source_video_url = video_url
+    saved_video_name = video_name
+    if source_media_type in {'video', 'audio'} and query_engine.video_editor:
+        resolved_clip_path, resolved_clip_url = _resolve_annotation_source_video(video_path, start_sec, end_sec, query_engine.video_editor)
+        if resolved_clip_path and resolved_clip_path.exists():
+            resolved_data_root = _data_root().resolve()
+            try:
+                clip_path = resolved_clip_path.resolve().relative_to(resolved_data_root).as_posix()
+            except Exception:
+                clip_path = _safe_text(str(resolved_clip_path))
+            clip_url = resolved_clip_url
+            saved_video_name = resolved_clip_path.name
+            video_path = clip_path
+            video_url = clip_url
+
     primary_computer = computer_entities[0] if computer_entities else 'NONE'
     primary_ideology = ideology_entities[0] if ideology_entities else 'NONE'
-    annotation_id = f"{video_name}__{start_sec:.1f}_{end_sec:.1f}__{primary_computer}__{primary_ideology}"
+    annotation_id = f"{saved_video_name}__{start_sec:.1f}_{end_sec:.1f}__{primary_computer}__{primary_ideology}"
     record = {
         'annotation_id': annotation_id,
-        'video_name': video_name,
+        'video_name': saved_video_name,
+        'source_video_name': video_name,
+        'saved_video_name': saved_video_name,
         'video_path': video_path,
-        'video_url': f"/media/{video_path}",
+        'video_url': video_url,
+        'source_video_path': source_video_path,
+        'source_video_url': source_video_url,
+        'clip_path': clip_path,
+        'clip_url': clip_url,
         'start_sec': round(start_sec, 1),
         'end_sec': round(end_sec, 1),
         'computer_entities': computer_entities,
@@ -1628,7 +1925,6 @@ def annotation_save():
     sync_to_neo4j = str(payload.get('sync_to_neo4j', 'true')).strip().lower() not in {'0', 'false', 'no', 'off'}
     sync_status = 'skipped'
     if sync_to_neo4j:
-        query_engine = get_neo4j_query()
         if query_engine.driver:
             try:
                 now = datetime.utcnow().isoformat() + 'Z'
@@ -1642,6 +1938,8 @@ def annotation_save():
                             v.path = $path,
                             v.relative_path = $path,
                             v.media_url = $media_url,
+                            v.clip_path = $clip_path,
+                            v.clip_url = $clip_url,
                             v.caption = CASE WHEN $caption = '' THEN coalesce(v.caption, '') ELSE $caption END,
                             v.ocr_text = CASE WHEN $ocr_text = '' THEN coalesce(v.ocr_text, '') ELSE $ocr_text END,
                             v.stage_tags = CASE WHEN size($stage_tags)=0 THEN coalesce(v.stage_tags, []) ELSE $stage_tags END,
@@ -1652,10 +1950,12 @@ def annotation_save():
                             v.audience = CASE WHEN $audience = '' THEN coalesce(v.audience, '') ELSE $audience END,
                             v.updated_at = $updated_at
                         """,
-                        name=video_name,
+                        name=saved_video_name,
                         path=video_path,
-                        media_url=f"/media/{video_path}",
+                        media_url=video_url,
                         source_media_type=source_media_type,
+                        clip_path=clip_path,
+                        clip_url=clip_url,
                         caption=record['caption'],
                         ocr_text=record['ocr_text'],
                         stage_tags=stage_tags,
@@ -1683,6 +1983,8 @@ def annotation_save():
                                 r.media_url = $media_url,
                                 r.media_type = 'video',
                                 r.annotation_source = 'manual',
+                                    r.clip_path = $clip_path,
+                                    r.clip_url = $clip_url,
                                 r.stage_tags = $stage_tags,
                                 r.course_tags = $course_tags,
                                 r.teaching_objectives = $teaching_objectives,
@@ -1692,12 +1994,14 @@ def annotation_save():
                                 r.updated_at = $updated_at
                             """,
                             entity=entity,
-                            video_name=video_name,
+                            video_name=saved_video_name,
                             confidence=record['confidence'],
                             caption=record['caption'],
                             ocr_text=record['ocr_text'],
                             path=video_path,
-                            media_url=f"/media/{video_path}",
+                            media_url=video_url,
+                            clip_path=clip_path,
+                            clip_url=clip_url,
                             stage_tags=stage_tags,
                             course_tags=course_tags,
                             teaching_objectives=teaching_objectives,
@@ -1849,6 +2153,36 @@ def _collect_linked_entities(query_engine: Any, hint_text: str, whitelist: Dict[
     return sorted(linked)
 
 
+def _resolve_annotation_source_video(video_path: str, start_sec: float, end_sec: float, editor: Any = None) -> Tuple[Path, str]:
+    """为人工标注生成可播放的剪辑文件；失败时回退原文件。"""
+    data_root = _data_root().resolve()
+    abs_path = (data_root / video_path).resolve() if not os.path.isabs(video_path) else Path(video_path).resolve()
+    try:
+        abs_path.relative_to(data_root)
+    except Exception:
+        return abs_path, _media_url_for_path(str(abs_path))
+
+    if editor is None or not abs_path.exists() or not abs_path.is_file():
+        return abs_path, _media_url_for_path(str(abs_path))
+
+    clip_dir = data_root / 'clips'
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    start_sec = max(0.0, float(start_sec or 0.0))
+    end_sec = max(start_sec, float(end_sec or start_sec))
+    duration = max(1.0, end_sec - start_sec)
+    source_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', abs_path.stem)
+    source_stem = re.sub(r'\s+', '_', source_stem).strip(' ._') or 'annotation'
+    clip_name = f"{source_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_s{str(round(start_sec, 1)).replace('.', 'p')}_e{str(round(end_sec, 1)).replace('.', 'p')}.mp4"
+    clip_path = clip_dir / clip_name
+    try:
+        if editor.clip_video(str(abs_path), str(clip_path), start_time=start_sec, duration=duration):
+            if clip_path.exists() and clip_path.is_file() and clip_path.stat().st_size > 1024:
+                return clip_path, _media_url_for_path(str(clip_path))
+    except Exception as exc:
+        logger.warning(f"人工标注剪辑失败，回退原视频: {exc}")
+    return abs_path, _media_url_for_path(str(abs_path))
+
+
 def _score_image_entity_relevance(query_engine: Any,
                                   entity_name: str,
                                   caption: str,
@@ -1919,20 +2253,30 @@ def upload_media():
     if media_type == 'unknown':
         return jsonify({'error': f'不支持的文件类型: {suffix}'}), 400
 
-    filename = _sanitize_upload_filename(file.filename)
+    original_filename = Path(str(file.filename or '').strip()).name
+    filename = _sanitize_upload_filename(original_filename)
     data_root = _data_root()
     abs_dir = data_root / subdir
     abs_dir.mkdir(parents=True, exist_ok=True)
-    target_path = abs_dir / filename
+
+    # 处理重名
+    final_filename = _resolve_unique_filename(abs_dir, filename)
+    target_path = abs_dir / final_filename
     file.save(str(target_path))
 
     relative_path = target_path.relative_to(data_root).as_posix()
+    display_base = _display_upload_name(original_filename)
+    display_name = f"{display_base}{suffix}"
+
     return jsonify({
         'ok': True,
         'relative_path': relative_path,
+        'original_filename': original_filename,
+        'display_name': display_name,
+        'stored_filename': final_filename,
         'media_type': 'video' if media_type in {'video', 'audio'} else 'image',
         'source_media_type': media_type,
-        'media_url': f"/media/{relative_path}",
+        'media_url': url_for('serve_media', filename=relative_path),
     })
 
 
@@ -1974,18 +2318,22 @@ def ingest_media():
         return jsonify({'error': 'Neo4j 不可用'}), 500
 
     media_url = f"/media/{relative_path}"
-    media_name = abs_path.name
+    media_name = _safe_text(payload.get('stored_filename')) or _safe_text(payload.get('display_name')) or abs_path.name
     linked_entities = _collect_linked_entities(query_engine, hint_text, whitelist, media_name=media_name)
+    if not _has_informative_content(caption or '', ocr_text or '', ' '.join(filename_terms)):
+        linked_entities = []
 
     with query_engine.driver.session(database=query_engine.database) as session:
         if is_video:
+            inferred_ideology = _infer_ideology_entities_from_computers(session, linked_entities, limit_per_entity=3)
+            all_video_entities = list(dict.fromkeys(linked_entities + inferred_ideology))
             session.run(
                 """
                 MERGE (v:Entity:Media:Video {name: $name})
                 SET v.media_type = 'video',
                     v.source_media_type = $source_media_type,
                     v.path = $path,
-                    v.relative_path = $relative_path,
+                    v.relative_path = $path,
                     v.media_url = $media_url,
                     v.caption = $caption,
                     v.updated_at = $updated_at
@@ -1998,7 +2346,7 @@ def ingest_media():
                 source_media_type=source_media_type,
                 updated_at=datetime.utcnow().isoformat() + 'Z',
             )
-            for entity in linked_entities:
+            for entity in all_video_entities:
                 session.run(
                     """
                     MATCH (e:Entity {name: $entity})
@@ -2022,7 +2370,7 @@ def ingest_media():
                 )
         elif is_image:
             image_node_enable = bool(app.config.get('ENABLE_IMAGE_NODE_INGEST', True))
-            image_node_threshold = float(app.config.get('IMAGE_NODE_MIN_SIMILARITY', 0.50) or 0.50)
+            image_node_threshold = float(app.config.get('IMAGE_NODE_MIN_SIMILARITY', '0.50') or 0.50)
             image_node_topk = max(1, int(app.config.get('IMAGE_NODE_MAX_LINKS', 3) or 3))
 
             ranked_candidates = _rank_image_entity_candidates(
@@ -2138,6 +2486,7 @@ def ingest_media():
         'caption': caption,
         'ocr_text': ocr_text,
         'linked_entities': linked_entities,
+        'inferred_ideology_entities': inferred_ideology if is_video else [],
         'primary_entity': primary_entity,
         'image_top_entities': image_top_entities,
         'filename_terms': filename_terms,
@@ -2161,10 +2510,13 @@ def upload_text():
     data_root = _data_root()
     abs_dir = data_root / 'uploads' / 'txt'
     abs_dir.mkdir(parents=True, exist_ok=True)
-    target_path = abs_dir / filename
+
+    final_filename = _resolve_unique_filename(abs_dir, filename)
+    target_path = abs_dir / final_filename
     file.save(str(target_path))
 
     relative_path = target_path.relative_to(data_root).as_posix()
+
     return jsonify({
         'ok': True,
         'relative_path': relative_path,
@@ -2369,28 +2721,27 @@ def serve_video(filename):
     the `/video/<filename>` route tolerant when clips have not been created and
     the original video lives in `data/video` or `data/video_fixed`.
     """
-    data_root = os.path.join(app.root_path, 'data')
-    # candidate subdirectories in priority order
-    candidates = ['clips', 'video', 'video_fixed', os.path.join('uploads', 'video')]
-    for sub in candidates:
-        video_dir = os.path.join(data_root, sub)
-        candidate_path = os.path.join(video_dir, filename)
-        try:
-            if os.path.exists(candidate_path) and os.path.isfile(candidate_path):
-                return send_from_directory(video_dir, filename)
-        except Exception:
-            # ignore and try next
-            continue
-    # not found in fallbacks -> return 404 via send_from_directory on clips (will raise)
-    # keep original behavior if nothing matched
-    video_dir = os.path.join(app.root_path, 'data', 'clips')
-    return send_from_directory(video_dir, filename)
+    data_root = _data_root()
+    candidates = [
+        data_root / 'clips',
+        data_root / 'video',
+        data_root / 'video_fixed',
+        data_root / 'uploads' / 'video',
+        data_root / 'uploads',
+    ]
+    return _send_media_from_roots(filename, candidates)
 
 
 @app.route('/media/<path:filename>')
 def serve_media(filename):
-    data_dir = os.path.join(app.root_path, 'data')
-    return send_from_directory(data_dir, filename)
+    data_root = _data_root()
+    return _send_media_from_roots(filename, [data_root, data_root / 'uploads', data_root / 'video', data_root / 'video_fixed', data_root / 'clips'])
+
+
+@app.route('/uploads/<path:filename>')
+def serve_uploads(filename):
+    data_root = _data_root()
+    return _send_media_from_roots(filename, [data_root / 'uploads', data_root])
 
 
 @app.errorhandler(404)
