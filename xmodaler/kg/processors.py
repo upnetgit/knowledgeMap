@@ -147,7 +147,7 @@ class TextProcessor:
         result = {}
         
         if not os.path.exists(txt_dir):
-            logger.warning(f"目录不存在: {txt_dir}")
+            logger.warning(f"目���不存在: {txt_dir}")
             return result
         
         for filename in os.listdir(txt_dir):
@@ -973,7 +973,8 @@ class CaptionGenerator:
             self.asr_backend = "faster-whisper"
             logger.info(f"已加载 ASR 后端: {self.asr_backend} ({self.asr_model_size}, {device})")
         except Exception as e:
-            logger.warning(f"无法加载 ASR 后端，将跳过语音转写: {str(e)}")
+            # ASR 只是增强能力，不应阻断视频主流程。
+            logger.info(f"ASR 后端不可用，将静默跳过语音转写: {str(e)}")
             self.asr_model = None
             self.asr_backend = None
 
@@ -984,17 +985,24 @@ class CaptionGenerator:
 
         audio_path = None
         try:
+            from shutil import which
+
+            ffmpeg_bin = which('ffmpeg')
+            if not ffmpeg_bin:
+                logger.info("未检测到 ffmpeg，跳过ASR")
+                return None
+
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
                 audio_path = tmp_file.name
 
             cmd = [
-                'ffmpeg', '-y', '-i', video_path,
+                ffmpeg_bin, '-nostdin', '-loglevel', 'error', '-y', '-i', video_path,
                 '-vn', '-ac', '1', '-ar', '16000',
                 audio_path,
             ]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                logger.warning(f"音频提取失败，跳过ASR: {result.stderr[:200]}")
+                logger.info(f"音频提取失败，跳过ASR: {result.stderr[:200]}")
                 return None
 
             segments, _ = self.asr_model.transcribe(
@@ -1011,7 +1019,7 @@ class CaptionGenerator:
             logger.info(f"ASR转写文本: {transcript[:100]}...")
             return transcript
         except Exception as e:
-            logger.warning(f"ASR转写失败 {video_path}: {str(e)}")
+            logger.info(f"ASR转写失败 {video_path}: {str(e)}")
             return None
         finally:
             if audio_path and os.path.exists(audio_path):
@@ -1571,7 +1579,7 @@ class CaptionGenerator:
         from collections import Counter
 
         counter = Counter(cleaned)
-        # 基于频率和长度排序，优先选择稳定且完整的文本
+        # 基于��率和长度排序，优先选择稳定且完整的文本
         ranked = sorted(
             counter.items(),
             key=lambda item: (-item[1], -sum(1 for ch in item[0] if '\u4e00' <= ch <= '\u9fff'), -len(item[0]))
@@ -1680,20 +1688,32 @@ class VideoEditor:
         """
         try:
             import subprocess
-            
-            # 使用ffmpeg剪辑视频
+            from shutil import which
+
+            ffmpeg_bin = which('ffmpeg')
+            if not ffmpeg_bin:
+                logger.error("未找到 ffmpeg，无法剪辑视频")
+                return False
+
+            # 使用更适合浏览器播放的编码参数重新封装/转码
             cmd = [
-                'ffmpeg',
-                '-i', input_path,
+                ffmpeg_bin,
+                '-nostdin',
+                '-y',
                 '-ss', str(start_time),
+                '-i', input_path,
                 '-t', str(duration),
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
                 '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
                 '-c:a', 'aac',
-                '-strict', 'experimental',
-                '-y',  # 覆盖输出文件
-                output_path
+                '-b:a', '128k',
+                output_path,
             ]
-            
+
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 logger.info(f"视频剪辑成功: {output_path}")
