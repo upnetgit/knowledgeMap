@@ -1,3 +1,190 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:7be851102a3bf8795622c3c4f4a25ce5e30b0dd75c05d238a3e2a330a7542e03
-size 5153
+{
+  "timestamp": "E:\\PyCharm 2025.3.1\\PycharmProjects\\xmodaler-master\\xmodaler-master\\tools",
+  "total_categories": 8,
+  "categories": {
+    "视频字幕生成 (Video Captioning)": [
+      {
+        "name": "TDConvED (MSR-VTT)",
+        "type": "video_captioning",
+        "priority": "⭐⭐⭐⭐⭐ 推荐",
+        "files": [
+          {
+            "path": "pretrained_models/MSR-VTT_TDConvED.pth",
+            "status": "✅ 179.4MB"
+          },
+          {
+            "path": "configs/video_caption/msrvtt/tdconved/tdconved.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      },
+      {
+        "name": "TA (MSVD)",
+        "type": "video_captioning",
+        "priority": "⭐⭐⭐ 备选",
+        "files": [
+          {
+            "path": "configs/pretrain/MSVD_TA.pth",
+            "status": "✅ 308.9MB"
+          },
+          {
+            "path": "configs/video_caption/msvd/ta/ta.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      }
+    ],
+    "图像字幕生成 (Image Captioning)": [
+      {
+        "name": "TDEN (CIDEr Score Optimization)",
+        "type": "image_captioning",
+        "priority": "⭐⭐⭐⭐ 推荐替代BLIP",
+        "files": [
+          {
+            "path": "configs/pretrain/CIDEr Score Optimization_TDEN.pth",
+            "status": "❌ 不存在"
+          },
+          {
+            "path": "configs/pretrain/tden/tden.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      },
+      {
+        "name": "Attention (Cross-Entropy Loss)",
+        "type": "image_captioning",
+        "priority": "⭐⭐⭐ 轻量化",
+        "files": [
+          {
+            "path": "configs/pretrain/Cross-Entropy Loss_Attention.pth",
+            "status": "❌ 不存在"
+          },
+          {
+            "path": "configs/pretrain/tden/tden.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      },
+      {
+        "name": "BLIP (Image Captioning Base)",
+        "type": "image_captioning",
+        "priority": "⭐⭐⭐ 当前使用",
+        "files": [
+          {
+            "path": "pretrained_models/blip-image-captioning-base/",
+            "status": "✅ 854.7MB"
+          }
+        ]
+      }
+    ],
+    "图像检索 (Image Retrieval)": [
+      {
+        "name": "TDEN (Caption-based Image Retrieval on Flickr30k)",
+        "type": "image_retrieval",
+        "priority": "⭐⭐⭐⭐ 多模态链接增强",
+        "files": [
+          {
+            "path": "pretrained_models/TDEN_RETRIEVAL/TDEN_RETRIEVAL.pth",
+            "status": "✅ 1116.8MB"
+          },
+          {
+            "path": "configs/pretrain/tden/tden.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      }
+    ],
+    "视觉问答 (Visual Question Answering)": [
+      {
+        "name": "UNITER (VQA)",
+        "type": "vqa",
+        "priority": "⭐⭐⭐ 需要微调",
+        "files": [
+          {
+            "path": "pretrained_models/Uniter/UNITER.pth",
+            "status": "✅ 435.3MB"
+          },
+          {
+            "path": "configs/pretrain/uniter/uniter.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      }
+    ],
+    "视觉常识推理 (Visual Commonsense Reasoning)": [
+      {
+        "name": "TDEN (Visual Commonsense Reasoning)",
+        "type": "visual_reasoning",
+        "priority": "⭐⭐⭐⭐ 现象理解",
+        "files": [
+          {
+            "path": "pretrained_models/TDEN/TDEN.pth",
+            "status": "✅ 1116.8MB"
+          },
+          {
+            "path": "configs/pretrain/tden/tden.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      }
+    ],
+    "视觉-语言预训练 (Vision-Language Pretraining)": [
+      {
+        "name": "TDEN (Pretrain)",
+        "type": "pretrain",
+        "priority": "⭐⭐⭐⭐⭐ SOTA微调基础",
+        "files": [
+          {
+            "path": "pretrained_models/TDEN/TDEN.pth",
+            "status": "✅ 1116.8MB"
+          },
+          {
+            "path": "configs/pretrain/tden/tden.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      },
+      {
+        "name": "UNITER (Pretrain)",
+        "type": "pretrain",
+        "priority": "⭐⭐⭐⭐ 通用基础",
+        "files": [
+          {
+            "path": "pretrained_models/Uniter/UNITER.pth",
+            "status": "✅ 435.3MB"
+          },
+          {
+            "path": "configs/pretrain/uniter/uniter.yaml",
+            "status": "✅ 0.0MB"
+          }
+        ]
+      }
+    ],
+    "特征提取 (Feature Extraction)": [
+      {
+        "name": "ResNet152",
+        "type": "feature_extractor",
+        "priority": "⭐⭐⭐⭐⭐ 必需",
+        "files": [
+          {
+            "path": "pretrained_models/resnet152-394f9c45.pth",
+            "status": "✅ 230.4MB"
+          }
+        ]
+      }
+    ],
+    "语义匹配 (Semantic Matching)": [
+      {
+        "name": "BERT-base-chinese",
+        "type": "semantic",
+        "priority": "⭐⭐⭐⭐⭐ 必需",
+        "files": [
+          {
+            "path": "BERT_cn/bert-base-chinese/",
+            "status": "✅ 392.6MB"
+          }
+        ]
+      }
+    ]
+  }
+}
