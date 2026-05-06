@@ -83,7 +83,7 @@ DECODE_STRATEGY:
 
 INFERENCE:
   NAME: "COCOEvaler"
-  VOCAB: "configs/video_captioning/vocabulary.txt"
+  VOCAB: "xmodaler/datasets/msrvtt_dataset/vocabulary.txt"
   ID_KEY: "image_id"
   VALUE: "caption"
   VAL_ANNFILE: "./data/annotations/captions_val.json"
