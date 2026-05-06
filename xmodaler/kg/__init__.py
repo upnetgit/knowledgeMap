@@ -6,7 +6,8 @@ from .processors import (
     VideoProcessor,
     CaptionGenerator
 )
-from .semantic import SemanticScorer, RelationReranker, summarize_text
+from .semantic import SemanticScorer, RelationReranker, summarize_text, detect_stage_tags, normalize_teaching_terms
+from .relation_inference import RelationInference
 
 __all__ = [
     'KGBuilder',
@@ -16,5 +17,8 @@ __all__ = [
     'CaptionGenerator',
     'SemanticScorer',
     'RelationReranker',
-    'summarize_text'
+    'summarize_text',
+    'detect_stage_tags',
+    'normalize_teaching_terms',
+    'RelationInference'
 ]
