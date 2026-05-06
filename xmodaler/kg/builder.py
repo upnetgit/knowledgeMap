@@ -181,6 +181,7 @@ class KGBuilder:
             'computer_science': [],  # 计算机核心知识点
             'ideology': []  # 思政元素
         }
+        self.same_class_relations = {'RELATED', 'CONTAINS', 'EXTENDS', 'PREREQUISITE'}
 
         # 连接Neo4j
         if GraphDatabase is None:
@@ -194,6 +195,9 @@ class KGBuilder:
             except Exception as e:
                 logger.error(f"连接Neo4j失败: {str(e)}")
                 self.driver = None
+
+        self._intra_edge_pruned_count = 0
+        self._cross_edge_kept_count = 0
 
     def _normalize_relation_type(self, relation_type: str) -> str:
         """将关系类型规范为Neo4j兼容的上层语义标签。"""
@@ -328,13 +332,21 @@ class KGBuilder:
                     continue
 
                 caption = support_sentence or f"{computer} 与 {ideology} 在教学语料中存在关联"
+
+                # Check if edge should be added based on sparsity rules
+                edge_attrs = {
+                    'relation': 'COMPUTER_REFLECTS_IDEOLOGY',
+                    'similarity': float(np.clip(final_score, 0.0, 1.0)),
+                    'caption': caption,
+                    'media_type': 'text',
+                }
+                if not self._should_add_edge(computer, ideology, edge_attrs, caption):
+                    continue
+
                 self.graph.add_edge(
                     computer,
                     ideology,
-                    relation='COMPUTER_REFLECTS_IDEOLOGY',
-                    similarity=float(np.clip(final_score, 0.0, 1.0)),
-                    caption=caption,
-                    media_type='text',
+                    **edge_attrs
                 )
                 self.relations['COMPUTER_REFLECTS_IDEOLOGY'].append(
                     (computer, ideology, float(np.clip(final_score, 0.0, 1.0)))
@@ -372,6 +384,8 @@ class KGBuilder:
             return ['Entity', 'IdeologyElement']
         if node_type == 'computer_science':
             return ['Entity', 'KnowledgePoint']
+        if node_type == 'knowledge_category':
+            return ['Entity', 'KnowledgeCategory']
 
         # 兜底：根据媒体类型和预置实体类型推断标签，减少 schema 漂移。
         media_type = str(attrs.get('media_type', '') or '').lower()
@@ -1710,7 +1724,9 @@ class KGBuilder:
             },
             'case_count': len(self.case_records),
             'media_count': len(self.media_records),
-            'density': nx.density(self.graph) if self.graph.number_of_nodes() > 0 else 0
+            'density': nx.density(self.graph) if self.graph.number_of_nodes() > 0 else 0,
+            'intra_edge_pruned_count': self._intra_edge_pruned_count,
+            'cross_edge_kept_count': self._cross_edge_kept_count,
         }
         if self.invalid_media_records:
             stats['invalid_media_records'] = self.invalid_media_records
@@ -1730,6 +1746,111 @@ class KGBuilder:
         if self.driver:
             self.driver.close()
             logger.info("已关闭Neo4j连接")
+
+    def _infer_same_class_relation(self, left: str, right: str) -> Tuple[Optional[str], float]:
+        """弱监督推断同类关系，关系集合限定为四类。"""
+        left = str(left or '').strip()
+        right = str(right or '').strip()
+        if not left or not right or left == right:
+            return None, 0.0
+
+        compact_l = self._compact_text(left)
+        compact_r = self._compact_text(right)
+        semantic = 0.0
+        try:
+            semantic = float(self.semantic_scorer.similarity(left, right)) if self.semantic_scorer else 0.0
+        except Exception:
+            semantic = 0.0
+
+        basic_tokens = ['基础', '入门', '初级', '导论', '概论', '原理']
+        advanced_tokens = ['进阶', '高级', '实践', '应用', '工程', '优化', '综合']
+
+        if compact_l and compact_r and (compact_l in compact_r or compact_r in compact_l):
+            if len(compact_l) >= len(compact_r):
+                return 'CONTAINS', max(0.72, semantic)
+            return 'EXTENDS', max(0.68, semantic)
+
+        if any(tok in left for tok in basic_tokens) and any(tok in right for tok in advanced_tokens):
+            return 'PREREQUISITE', max(0.66, semantic)
+        if any(tok in right for tok in basic_tokens) and any(tok in left for tok in advanced_tokens):
+            return 'EXTENDS', max(0.64, semantic)
+
+        if semantic >= 0.42:
+            return 'RELATED', min(0.85, max(0.55, semantic))
+        return None, 0.0
+
+    def _build_sparse_same_class_relations(self, entities: List[str], per_node_limit: int = 2) -> None:
+        """构建稀疏同类边，避免同类实体全连接。"""
+        names = [str(item).strip() for item in (entities or []) if str(item).strip()]
+        if len(names) < 2:
+            return
+
+        for source in names:
+            candidates: List[Tuple[str, str, float]] = []
+            for target in names:
+                if source == target:
+                    continue
+                relation, score = self._infer_same_class_relation(source, target)
+                if relation in self.same_class_relations and score >= 0.52:
+                    candidates.append((target, relation, float(score)))
+
+            candidates.sort(key=lambda item: item[2], reverse=True)
+            for target, relation, score in candidates[:max(1, int(per_node_limit))]:
+                self.graph.add_edge(source, target, relation=relation, similarity=score)
+                self.relations[relation].append((source, target, score))
+
+    def _build_knowledge_category_bridges(self) -> None:
+        """补充“知识点->大类->思政元素”链路，支持教学性查询推理。"""
+        category_rules = {
+            '编程实践': {
+                'keywords': ['编程', '程序设计', '代码', '实践', '实验', '开发'],
+                'ideology_hints': ['规范意识', '工匠精神', '责任意识'],
+            },
+            '系统思维': {
+                'keywords': ['操作系统', '网络', '并发', '体系结构', '调度'],
+                'ideology_hints': ['全局观念', '协同意识', '家国情怀'],
+            },
+            '数据智能': {
+                'keywords': ['数据', '算法', '机器学习', '人工智能', '模型'],
+                'ideology_hints': ['创新精神', '科学精神', '法治意识'],
+            },
+        }
+
+        ideology_set = set(self.entity_types.get('ideology', []) or [])
+        if not ideology_set:
+            return
+
+        for kp in self.entity_types.get('computer_science', []) or []:
+            kp_name = str(kp).strip()
+            if not kp_name:
+                continue
+
+            chosen_category = ''
+            for category, rule in category_rules.items():
+                if any(token in kp_name for token in rule.get('keywords', [])):
+                    chosen_category = category
+                    break
+            if not chosen_category:
+                chosen_category = '编程实践'
+
+            if not self.graph.has_node(chosen_category):
+                self.graph.add_node(
+                    chosen_category,
+                    type='knowledge_category',
+                    labels=['Entity', 'KnowledgeCategory'],
+                    media_type='text',
+                    summary=f"知识点大类：{chosen_category}",
+                )
+
+            self.graph.add_edge(kp_name, chosen_category, relation='CONTAINS', similarity=0.88)
+            self.relations['CONTAINS'].append((kp_name, chosen_category, 0.88))
+
+            for hint in category_rules.get(chosen_category, {}).get('ideology_hints', []):
+                target = next((name for name in ideology_set if hint in name or name in hint), None)
+                if not target:
+                    continue
+                self.graph.add_edge(chosen_category, target, relation='COMPUTER_REFLECTS_IDEOLOGY', similarity=0.86)
+                self.relations['COMPUTER_REFLECTS_IDEOLOGY'].append((chosen_category, target, 0.86))
     
     def insert_predefined_entities(self, computer_entities: List[str], ideology_entities: List[str]):
         """
@@ -1752,19 +1873,13 @@ class KGBuilder:
                 type=node_type,
                 labels=['Entity', 'KnowledgePoint'] if node_type == 'computer_science' else ['Entity', 'IdeologyElement'],
             )
-        
-        # 创建相似关系（同类实体间）
-        for i, entity1 in enumerate(computer_entities):
-            for j, entity2 in enumerate(computer_entities):
-                if i != j:
-                    self.graph.add_edge(entity1, entity2, relation='SIMILAR', similarity=0.5)
-                    self.relations['SIMILAR'].append((entity1, entity2, 0.5))
-        
-        for i, entity1 in enumerate(ideology_entities):
-            for j, entity2 in enumerate(ideology_entities):
-                if i != j:
-                    self.graph.add_edge(entity1, entity2, relation='SIMILAR', similarity=0.5)
-                    self.relations['SIMILAR'].append((entity1, entity2, 0.5))
+
+        # 同类边改为稀疏关系推断，避免预置实体全连接。
+        self._build_sparse_same_class_relations(computer_entities, per_node_limit=2)
+        self._build_sparse_same_class_relations(ideology_entities, per_node_limit=1)
+
+        # 补充教学推理链路：知识点 -> 大类 -> 思政元素。
+        self._build_knowledge_category_bridges()
         
         logger.info(f"已插入 {len(computer_entities)} 个计算机实体和 {len(ideology_entities)} 个思政实体")
     
@@ -1785,3 +1900,56 @@ class KGBuilder:
             self.relations[rel_type_norm].append((entity1, entity2, similarity))
         
         logger.info(f"已创建 {len(relations_data)} 个自定义关系")
+
+    def _should_add_edge(self, source: str, target: str, attrs: Dict, evidence: str) -> bool:
+        """Determine if an edge should be added based on sparsity and evidence rules.
+
+        Args:
+            source: Source entity name
+            target: Target entity name
+            attrs: Edge attributes
+            evidence: Evidence text (caption, sentence, etc.)
+
+        Returns:
+            True if edge should be added, False otherwise
+        """
+        # Check evidence validity
+        if not self.is_evidence_valid(evidence):
+            return False
+
+        # Get entity types
+        source_type = self.graph.nodes[source].get('type') if self.graph.has_node(source) else None
+        target_type = self.graph.nodes[target].get('type') if self.graph.has_node(target) else None
+
+        # Cross-class edges get priority
+        is_cross_class = source_type != target_type
+
+        # For same-class edges, limit per node
+        if not is_cross_class:
+            # Count existing same-class edges for source
+            existing_count = sum(1 for _, _, data in self.graph.edges(source, data=True)
+                               if data.get('relation') in self.same_class_relations)
+            if existing_count >= 2:  # Limit to 2 per node
+                self._intra_edge_pruned_count += 1
+                return False
+
+        # Similarity threshold
+        similarity = attrs.get('similarity', 0.0)
+        threshold = 0.45 if is_cross_class else 0.55
+
+        if similarity >= threshold:
+            if is_cross_class:
+                self._cross_edge_kept_count += 1
+            return True
+        else:
+            if not is_cross_class:
+                self._intra_edge_pruned_count += 1
+            return False
+
+    def is_evidence_valid(self, text: str, min_chars: int = 12) -> bool:
+        """Check if evidence text is valid for edge creation."""
+        import re
+        cleaned = re.sub(r"\s+", "", str(text or ""))
+        core = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", cleaned)
+        return len(core) >= int(min_chars)
+
